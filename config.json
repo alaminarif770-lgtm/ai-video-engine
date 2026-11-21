@@ -5,6 +5,11 @@
   "R2_BUCKET_NAME": "story-assets",
   "R2_ACCESS_KEY_ID": "3337276d88b5c35999d59f90a3b75c02",
   "R2_SECRET_ACCESS_KEY": "df7880c6a4b518b10aac2a727b60ea4359becd4ace54c75da874d50c00e2456e",
+  "GITHUB_PAT": "",
+  "GITHUB_OWNER": "alaminarif770-lgtm",
+  "GITHUB_REPO": "story-video-renderer",
+  "GITHUB_WORKFLOW": "render.yml",
+  "GITHUB_REF": "main",
   "APP_PASSWORD": "157300",
   "APP_BASE_URL": ""
 }
