@@ -32,7 +32,7 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # ৩২ MB পর্যন্ত বড় JSON সাপোর্ট (৫০০+ সিন)
 
 
-# ================= কনফিগারেশন (Render Env অথবা config.json থেকে পড়বে) =================
+# ================= কনফিগারেশন =================
 def _load_local_config():
     if os.path.exists("config.json"):
         try:
@@ -66,6 +66,8 @@ R2_ACCESS_KEY_ID = get_conf("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = get_conf("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = get_conf("R2_BUCKET_NAME", "story-assets")
 
+PROXY_URL = get_conf("PROXY")  # প্রক্সি লিংক (যদি থাকে)
+
 GITHUB_PAT = get_conf("GITHUB_PAT")
 GITHUB_OWNER = get_conf("GITHUB_OWNER", "alaminarif770-lgtm")
 GITHUB_REPO = get_conf("GITHUB_REPO", "story-video-renderer")
@@ -86,11 +88,10 @@ os.environ.setdefault("GEMINI_COOKIE_PATH", GEMINI_CACHE_DIR)
 R2_COOKIES_KEY = "_system/cookies.json"
 R2_HISTORY_KEY = "_system/history.json"
 INTERNAL_PROJECT_FILES = {"meta.json", "job_state.json", "input_scenes.json", "story_bible.json"}
-PRESIGN_TTL_LONG = 21600  # ৬ ঘণ্টা (৫ GB+ ফাইল নিশ্চিন্তে ডাউনলোডের জন্য)
+PRESIGN_TTL_LONG = 21600  # ৬ ঘণ্টা
 
-# কুলডাউন ও পেসিং সেটিংস
 COOLDOWN_TIERS = [180, 600, 1800]  # ৩ মিনিট -> ১০ মিনিট -> ৩০ মিনিট
-MIN_ACCOUNT_INTERVAL = 18.0        # প্রতি একাউন্টের দুটি রিকোয়েস্টের মাঝে ন্যূনতম গ্যাপ (সেকেন্ড)
+MIN_ACCOUNT_INTERVAL = 18.0        # প্রতি একাউন্টের দুটি রিকোয়েস্টের মাঝে গ্যাপ
 
 state_lock = threading.Lock()
 r2_meta_lock = threading.Lock()
@@ -199,7 +200,7 @@ def _clear_gemini_cache(psid=None):
         pass
 
 
-# ================= ঐচ্ছিক পাসওয়ার্ড প্রোটেকশন ও GZIP ব্যান্ডউইথ সাশ্রয় =================
+# ================= GZIP ব্যান্ডউইথ সাশ্রয় =================
 @app.before_request
 def check_auth():
     if not APP_PASSWORD:
@@ -218,7 +219,6 @@ def check_auth():
 
 @app.after_request
 def compress_response(response):
-    """JSON ও HTML রেসপন্স GZIP করে Render-এর ব্যান্ডউইথ ৮৫-৯০% বাঁচায়"""
     if (
         response.direct_passthrough
         or response.is_streamed
@@ -306,7 +306,6 @@ def r2_head_object(s3, key):
 
 
 def r2_invalidate_archive_zip(s3, slug):
-    """নতুন ছবি যুক্ত হলে বা ফাইল ডিলিট হলে পুরোনো ZIP ক্যাশ মুছে দেয়"""
     if not s3 or not slug:
         return
     for key in (f"projects/{slug}/_archive/{slug}.zip", f"projects/{slug}/_archive/zip_status.json"):
@@ -387,7 +386,7 @@ def r2_list_video_objects(s3, slug):
     return items
 
 
-# ================= কুকি পুল ও R2 পার্সিস্টেন্স =================
+# ================= কুকি পুল ও ৩-৪ ঘণ্টার অটো-সিঙ্ক মেকানিজম =================
 def mask_cookie(psid):
     if len(psid) <= 12:
         return "***"
@@ -433,6 +432,25 @@ def _make_cookie_record(psid, psidts=None, name="", enabled=True, existing_dict=
         "last_used_at": float((existing_dict or {}).get("last_used_at", 0.0)),
         "last_error": str((existing_dict or {}).get("last_error", "")),
     }
+
+
+def _sync_client_cookies_to_storage(cid, client):
+    """৩-৪ ঘণ্টার লগআউট ফিক্স: GeminiClient এর নতুন ঘূর্ণায়মান 1PSIDTS কুকি R2 তে অটো-সিঙ্ক করে"""
+    if not client or not getattr(client, "cookies", None):
+        return
+    try:
+        cookies_dict = client.cookies
+        new_psidts = cookies_dict.get("__Secure-1PSIDTS") or cookies_dict.get("Secure-1PSIDTS")
+        if new_psidts:
+            with state_lock:
+                target = next((c for c in cookie_pool if c["id"] == cid), None)
+                if target and target.get("psidts") != new_psidts:
+                    target["psidts"] = new_psidts
+                    target["version"] = target.get("version", 1) + 1
+                    add_log(f"🔄 {target['name']}-এর ঘূর্ণায়মান কুকি স্বয়ংক্রিয়ভাবে রিনিউ ও R2-তে সিঙ্ক হয়েছে!")
+                    save_cookies_to_r2()
+    except Exception as e:
+        print(f"Cookie auto-sync error: {e}")
 
 
 def _cookie_name_exists(name, exclude_id=None):
@@ -620,7 +638,7 @@ def bootstrap_from_r2():
         _bootstrapped = True
 
 
-# ================= ইমেজ ওয়াটারমার্ক, রেফারেন্স কোলাজ ও ভয়েসওভার টেক্সট =================
+# ================= ইমেজ ওয়াটারমার্ক ও রেফারেন্স শিট =================
 def apply_watermark(image_bytes, scene_num, mode=True):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
 
@@ -653,7 +671,6 @@ def _safe_key_name(key):
 
 
 def _build_labeled_collage(char_items, out_path):
-    """একই সিনে ২-৪ জন ক্যারেক্টার থাকলে নামের লেবেলসহ একটি রেফারেন্স শিট বানায়"""
     tile_w, tile_h = 380, 420
     label_h = 48
     gap = 14
@@ -700,7 +717,6 @@ def _build_labeled_collage(char_items, out_path):
 
 
 def build_clean_voiceover_text(scenes_data):
-    """কোনো দাঁড়ি-কমা বা শব্দ পরিবর্তন না করে সব সিনের narration শুধু একটি স্পেস দিয়ে একটানা জোড়া লাগায়"""
     parts = []
     for sc in scenes_data:
         if not isinstance(sc, dict):
@@ -711,7 +727,7 @@ def build_clean_voiceover_text(scenes_data):
     return " ".join(parts)
 
 
-# ================= নন-ব্লকিং ও ডিরেক্ট-R2 টেলিগ্রাম কিউ ওয়ার্কার =================
+# ================= টেলিগ্রাম কিউ ওয়ার্কার =================
 tg_queue = queue.Queue(maxsize=1000)
 _tg_thread_lock = threading.Lock()
 _tg_thread = None
@@ -796,7 +812,6 @@ def _send_telegram_photo_sync(image_bytes, scene_num, narration):
 
 
 def _send_telegram_photo_url_sync(s3_cli, r2_key, scene_num, narration):
-    """Render-এর ০ MB ব্যান্ডউইথ খরচ করে সরাসরি Cloudflare R2 URL টেলিগ্রামে পাঠায়"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         _log_tg_failure("TELEGRAM_BOT_TOKEN বা TELEGRAM_CHAT_ID সেট করা নেই")
         return False
@@ -825,7 +840,6 @@ def _send_telegram_photo_url_sync(s3_cli, r2_key, scene_num, narration):
     except Exception:
         pass
 
-    # শুধু URL কোনো কারণে ব্যর্থ হলে নিরাপদ ফলব্যাক
     img_bytes = r2_download_bytes(s3_cli, r2_key)
     if img_bytes:
         try:
@@ -896,7 +910,7 @@ def notify_cookie_issue(name, preview, reason, level="warning"):
     )
 
 
-# ================= GitHub Actions (২য় সার্ভার — ভিডিও ও বড় ZIP) ট্রিগার হেল্পার =================
+# ================= GitHub Actions ট্রিগার হেল্পার =================
 def trigger_github_video_render(slug, mode="video"):
     if not GITHUB_PAT:
         return False, "Render-এ GITHUB_PAT সেট করা নেই।"
@@ -994,11 +1008,15 @@ async def _test_single_cookie_async(cookie_entry):
     add_log(f"🔍 {cookie_entry['name']} ({cookie_entry['preview']}) পরীক্ষা করা হচ্ছে...")
     client = None
     try:
+        # প্রক্সি সাপোর্টসহ ইনিট
         client = GeminiClient(
             secure_1psid=cookie_entry["psid"],
             secure_1psidts=cookie_entry.get("psidts"),
+            proxy=PROXY_URL if PROXY_URL else None,
         )
         await client.init(timeout=45, auto_close=False, auto_refresh=True)
+        _sync_client_cookies_to_storage(cid, client)  # নতুন কুকি সেভ
+
         with state_lock:
             for c in cookie_pool:
                 if c["id"] == cid:
@@ -1190,7 +1208,6 @@ def _pick_next_cookie():
                 c["status"] = "standby"
                 c["cooldown_probe"] = True
 
-            # সিরিয়াল কার্সর ঠিক পরের একাউন্টে সেট করা হলো
             rr_cursor = (idx + 1) % n
             picked = dict(c)
             picked["order_num"] = idx + 1
@@ -1266,7 +1283,7 @@ async def _call_gemini_with_pool(
     temp_filename="temp_gen.jpg",
     max_attempts=3,
 ):
-    """একটি রিইউজেবল সিরিয়াল কুকি-পুল রোটেশন কলার (টেক্সট ও ইমেজ উভয় কলের জন্য)"""
+    """প্রক্সি ও ডিরেক্ট-ডাউনলোড অপটিমাইজেশনসহ সিরিয়াল কুকি রোটেশন কলার"""
     last_error = "সব চেষ্টায় ব্যর্থ"
 
     for attempt in range(1, max_attempts + 1):
@@ -1315,7 +1332,7 @@ async def _call_gemini_with_pool(
         c_ver = chosen.get("version", 1)
         acc_label = f"#{c_order} {cname}"
 
-        # স্মার্ট পার-একাউন্ট পেসিং
+        # পার-একাউন্ট পেসিং
         elapsed_since_use = time.time() - chosen.get("last_used_at", 0.0)
         if chosen.get("last_used_at", 0.0) > 0 and elapsed_since_use < MIN_ACCOUNT_INTERVAL:
             need_wait = round((MIN_ACCOUNT_INTERVAL - elapsed_since_use) + random.uniform(0.5, 2.5), 1)
@@ -1336,9 +1353,11 @@ async def _call_gemini_with_pool(
             update_state(status_text=f"Connecting {acc_label}...", active_account=acc_label)
             add_log(f"🔑 {acc_label} ({chosen['preview']}) কানেক্ট হচ্ছে...")
             try:
+                # প্রক্সি সাপোর্টসহ জেমিনি ক্লায়েন্ট
                 client = GeminiClient(
                     secure_1psid=chosen["psid"],
                     secure_1psidts=chosen.get("psidts"),
+                    proxy=PROXY_URL if PROXY_URL else None,
                 )
                 await run_cancellable(
                     client.init(timeout=45, auto_close=False, auto_refresh=True),
@@ -1346,6 +1365,7 @@ async def _call_gemini_with_pool(
                     timeout=50,
                 )
                 clients_map[cid] = (client, c_ver)
+                _sync_client_cookies_to_storage(cid, client)  # রিনিউ কুকি সংরক্ষণ
                 add_log(f"✅ {acc_label} কানেক্ট হয়েছে!")
             except InterruptedError:
                 raise
@@ -1370,6 +1390,7 @@ async def _call_gemini_with_pool(
         try:
             coro = client.generate_content(prompt, files=files) if files else client.generate_content(prompt)
             response = await run_cancellable(coro, stop_event, timeout=95)
+            _sync_client_cookies_to_storage(cid, client)  # প্রতিটি কলের পর কুকি রিনিউ চেক
 
             if not expect_image:
                 resp_text = (getattr(response, "text", "") or "").strip()
@@ -1384,7 +1405,7 @@ async def _call_gemini_with_pool(
                 _mark_cookie_success(cid)
                 return "OK", resp_text, acc_label
 
-            # Image response expected
+            # ইমেজ রেসপন্স হ্যান্ডলিং
             if not response or not response.images:
                 resp_text = (getattr(response, "text", "") or "").strip()[:140]
                 if _is_auth_error(resp_text):
@@ -1397,17 +1418,39 @@ async def _call_gemini_with_pool(
                 continue
 
             first_image = response.images[0]
-            await run_cancellable(
-                first_image.save(path=STORAGE_DIR, filename=temp_filename),
-                stop_event,
-                timeout=30,
-            )
+            raw_bytes = None
 
-            if not os.path.exists(temp_path):
-                raise RuntimeError("টেম্পোরারি ইমেজ সেভ হয়নি")
+            # ================= ব্যান্ডউইথ সেভিং অপটিমাইজেশন =================
+            # গুগলের ১ MB ছবি প্রক্সি দিয়ে না টেনে সরাসরি রেন্ডারের ফ্রি ব্যান্ডউইথ দিয়ে ডাউনলোড
+            img_url = getattr(first_image, "url", None)
+            if img_url:
+                try:
+                    r_img = await run_cancellable(
+                        asyncio.to_thread(
+                            requests.get,
+                            img_url,
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                            timeout=25,
+                        ),
+                        stop_event,
+                        timeout=30,
+                    )
+                    if r_img and r_img.status_code == 200 and len(r_img.content) > 1000:
+                        raw_bytes = r_img.content
+                except Exception:
+                    raw_bytes = None
 
-            with open(temp_path, "rb") as f:
-                raw_bytes = f.read()
+            # ফলব্যাক: ডিরেক্ট ফেচ না হলে সাধারণ save() মেথড
+            if not raw_bytes:
+                await run_cancellable(
+                    first_image.save(path=STORAGE_DIR, filename=temp_filename),
+                    stop_event,
+                    timeout=30,
+                )
+                if not os.path.exists(temp_path):
+                    raise RuntimeError("টেম্পোরারি ইমেজ সেভ হয়নি")
+                with open(temp_path, "rb") as f:
+                    raw_bytes = f.read()
 
             _mark_cookie_success(cid)
             return "OK", raw_bytes, acc_label
@@ -1436,7 +1479,7 @@ async def _call_gemini_with_pool(
                         notify_cookie_issue(cd_info[1], cd_info[2], err_msg, level="critical")
                 elif cd_info[0] == "cooldown":
                     mins = int(cd_info[2] // 60)
-                    add_log(f"❄️ {cd_info[1]} কুলডাউনে গেল ({mins} মিনিট, লেভেল {cd_info[3]})। পরের একাউন্ট দিয়ে চালিয়ে নেবে।")
+                    add_log(f"❄️ {cd_info[1]} কুলডাউনে গেল ({mins} মিনিট, লেভেল {cd_info[3]})।")
 
             save_cookies_to_r2()
             if attempt < max_attempts:
@@ -1634,7 +1677,7 @@ async def async_generation_worker(
         new_job_id = state["job_id"] + 1
         if state["should_stop"]:
             stop_event.set()
-        rr_cursor = 0  # প্রতি নতুন প্রজেক্ট সিরিয়ালি একাউন্ট #১ থেকে শুরু করবে
+        rr_cursor = 0
         worker_control["loop"] = loop
         worker_control["stop_event"] = stop_event
         worker_control["wakeup_event"] = wakeup_event
@@ -1664,7 +1707,6 @@ async def async_generation_worker(
 
     clients_map = {}
     last_alert_at = {}
-
     failed_scenes_list = []
     completed_nums = set()
 
@@ -1782,7 +1824,7 @@ async def async_generation_worker(
             f"কাজ শুরু হয়েছে!"
         )
 
-        # ================= কনসিস্টেন্সি ও রেফারেন্স পোর্ট্রেট সেটআপ =================
+        # ================= কনসিস্টেন্সি সেটআপ =================
         auto_bible = {"style_bible": style_bible, "eras": eras_map, "characters": chars_map, "char_keywords": {}, "era_keywords": {}}
         if consistency_mode == "auto" and not style_bible and not chars_map:
             auto_bible = await _auto_analyze_old_json(
@@ -1879,7 +1921,7 @@ async def async_generation_worker(
                     sf.write(sa_bytes)
                 add_log("♻️ R2 থেকে Style Anchor ইমেজ রিস্টোর হয়েছে।")
 
-        # ================= একক সিন জেনারেশন হেল্পার =================
+        # ================= একক সিন জেনারেশন =================
         aborted_no_cookies = False
         scene_lookup = {}
         uploaded_new_scene = False
@@ -2057,7 +2099,7 @@ async def async_generation_worker(
                 if not await wait_if_paused(stop_event, unpause_event):
                     break
 
-        # ================= Auto-Video-র আগে ১ বার অটো-রিট্রাই =================
+        # ================= রিট্রাই =================
         if auto_video and failed_scenes_list and not stop_event.is_set() and not aborted_no_cookies:
             retry_items = list(failed_scenes_list)
             failed_scenes_list.clear()
@@ -2093,7 +2135,6 @@ async def async_generation_worker(
             except Exception:
                 pass
 
-        # ফাইনাল সামারি ও স্ট্যাটাস সেভ
         was_stopped = stop_event.is_set()
         final_status = "stopped" if (was_stopped or aborted_no_cookies) else "completed"
 
@@ -2129,14 +2170,13 @@ async def async_generation_worker(
                 summary_msg += f'\n📦 <a href="{APP_BASE_URL}/api/r2/download-zip/{slug}">১-ক্লিক ZIP ডাউনলোড করুন</a>'
             send_telegram_message(summary_msg)
 
-            # ================= Phase-2: Auto-Video Trigger =================
+            # ================= Auto-Video Trigger =================
             if auto_video:
                 if failed_scenes_list:
                     add_log("🚫 অটো-ভিডিও থামানো হয়েছে: রিট্রাই করার পরও কিছু সিন ব্যর্থ থাকায় ভিডিও শুরু করা হয়নি।", level="fail")
                     send_telegram_message(
                         f"⚠️ <b>অটো-ভিডিও থামানো হয়েছে ({html.escape(title)})</b>\n"
-                        f"১ বার রিট্রাই করার পরও {len(failed_scenes_list)} টি সিন ব্যর্থ রয়েছে।\n"
-                        f"ম্যানুয়ালি ব্যর্থ সিন ঠিক করে Videos ট্যাব থেকে Create Video চাপুন।"
+                        f"১ বার রিট্রাই করার পরও {len(failed_scenes_list)} টি সিন ব্যর্থ রয়েছে।"
                     )
                 else:
                     vid_objs = r2_list_video_objects(s3, slug)
@@ -2148,7 +2188,7 @@ async def async_generation_worker(
                         add_log("⚠️ অটো-ভিডিও চালু করা যায়নি: প্রজেক্টে ভয়েসওভার অডিও আপলোড করা নেই।", level="warn")
                         send_telegram_message(
                             f"⚠️ <b>অটো-ভিডিও শুরু হয়নি ({html.escape(title)})</b>\n"
-                            f"সব ছবি তৈরি হয়েছে, কিন্তু ভয়েসওভার অডিও আপলোড করা ছিল না। Videos ট্যাব থেকে অডিও দিয়ে Create Video চাপুন।"
+                            f"সব ছবি তৈরি হয়েছে, কিন্তু ভয়েসওভার অডিও আপলোড করা ছিল না।"
                         )
                     else:
                         ok_trig, trig_msg = trigger_github_video_render(slug, mode="video")
@@ -2271,7 +2311,7 @@ def get_status():
     return jsonify(snapshot)
 
 
-# ================= কুকিজ ম্যানেজমেন্ট API (Add, Edit, Unique Name, Hot-Add) =================
+# ================= কুকিজ ম্যানেজমেন্ট API =================
 @app.route("/api/cookies/add", methods=["POST"])
 def api_add_cookie():
     bootstrap_from_r2()
@@ -2581,7 +2621,7 @@ def stop_pipeline():
     return jsonify({"status": "idle"})
 
 
-# ================= হিস্ট্রি ও রিজিউম / রিট্রাই API =================
+# ================= হিস্ট্রি API =================
 @app.route("/api/history", methods=["GET"])
 def api_get_history():
     bootstrap_from_r2()
@@ -2694,7 +2734,6 @@ def api_video_presign_upload():
     if not s3:
         return jsonify({"error": "R2 কনফিগার করা নেই।"}), 500
 
-    # একই ধরনের পুরোনো ফাইল মুছে নতুন নাম রাখা যাতে সবসময় লেটেস্ট ফাইল রেন্ডার হয়
     existing = r2_list_video_objects(s3, slug)
     for item in existing:
         if os.path.splitext(item["name"])[1].lower() in valid_exts[kind]:
@@ -3017,7 +3056,6 @@ def r2_list_project_files(slug):
 
 @app.route("/api/r2/file", methods=["GET"])
 def r2_stream_file():
-    """Render-এর ব্যান্ডউইথ বাঁচাতে সরাসরি Cloudflare R2 Presigned URL-এ ৩০২ রিডাইরেক্ট করে"""
     key = request.args.get("key", "").strip()
     download = request.args.get("download", "0") == "1"
     if not key or not key.startswith("projects/") or ".." in key:
@@ -3086,7 +3124,6 @@ def r2_zip_status(slug):
 
 @app.route("/api/r2/download-zip/<slug>", methods=["GET"])
 def r2_stream_zip(slug):
-    """৫ GB+ ZIP-ও Render দিয়ে পাস না করে R2 থেকে সরাসরি ডাউনলোড করায় (দরকারে ২য় সার্ভারে তৈরি করে)"""
     if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
         return jsonify({"error": "Invalid project slug"}), 400
 
@@ -3099,7 +3136,6 @@ def r2_stream_zip(slug):
     if head:
         return redirect(_build_zip_download_url(s3, slug), code=302)
 
-    # বড় প্রজেক্ট বা ২য় সার্ভার থাকলে Render দিয়ে স্ট্রিম না করে ২য় সার্ভারে ZIP তৈরি করানো
     if GITHUB_PAT:
         st = r2_read_json(s3, f"projects/{slug}/_archive/zip_status.json", default={}) or {}
         curr_status = str(st.get("status") or "").lower()
@@ -3177,7 +3213,6 @@ poll();
 </html>"""
         return Response(wait_html, mimetype="text/html; charset=utf-8")
 
-    # GITHUB_PAT না থাকলে কেবল তখনই পুরোনো stream_zip ফলব্যাক
     objects_to_zip = []
     prefix = f"projects/{slug}/"
     try:
