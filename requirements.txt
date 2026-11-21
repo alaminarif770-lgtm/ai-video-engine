@@ -1,7 +1,1 @@
-flask
-requests
-pillow
-gunicorn
-gemini-webapi
-boto3
-stream-zip
+hh
