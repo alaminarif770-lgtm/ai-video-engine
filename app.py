@@ -28,31 +28,119 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 import requests
 from stream_zip import ZIP_32, stream_zip
 
-# ================= CRITICAL FIX: gemini-webapi 2.1.1 All BatchExecute 400 Error Bypass =================
-class _DummyBatchResponse:
-    status_code = 200
-    text = ")]}'\n\n"
-    def json(self):
-        return []
+# ================= CRITICAL FIX: Google 20261112 Full CookieJar + Image =s0?alr=yes Fix =================
+import base64
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-async def _bypass_broken_init_rpc(self, *args, **kwargs):
-    return _DummyBatchResponse()
 
-if hasattr(GeminiClient, "_init_rpc"):
-    GeminiClient._init_rpc = _bypass_broken_init_rpc
-if hasattr(GeminiClient, "_fetch_user_status"):
-    GeminiClient._fetch_user_status = _bypass_broken_init_rpc
-if hasattr(GeminiClient, "_batch_execute"):
-    _orig_batch_execute = GeminiClient._batch_execute
-    async def _safe_batch_execute(self, payloads, *args, **kwargs):
-        try:
-            return await _orig_batch_execute(self, payloads, *args, **kwargs)
-        except Exception as e:
-            if "400" in str(e):
-                return _DummyBatchResponse()
-            raise
-    GeminiClient._batch_execute = _safe_batch_execute
-# =======================================================================================================
+def parse_full_cookies_input(raw_input, raw_psidts=""):
+    """Cookie-Editor JSON Array, JSON Dict, Raw Cookie Header কিংবা একক 1PSID স্ট্রিং পার্স করে"""
+    text = str(raw_input or "").strip()
+    extra_ts = str(raw_psidts or "").strip()
+
+    # যদি ইনপুটে শুধু ১টি কুকি থাকে কিন্তু Render Env-এ GEMINI_COOKIES_JSON থাকে, তবে সেটিও মার্জ করবে
+    env_json = os.environ.get("GEMINI_COOKIES_JSON", "").strip()
+    cookie_list = []
+    cookie_dict = {}
+
+    for src_text in (env_json, text):
+        if not src_text:
+            continue
+        s = src_text.strip()
+        if not s.startswith(("[", "{")) and "=" not in s and ";" not in s and len(s) > 200:
+            try:
+                dec = base64.b64decode(s).decode("utf-8").strip()
+                if dec.startswith(("[", "{")):
+                    s = dec
+            except Exception:
+                pass
+
+        if s.startswith("[") or s.startswith("{"):
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, dict) and isinstance(parsed.get("cookies"), list):
+                    parsed = parsed["cookies"]
+                if isinstance(parsed, list):
+                    for item in parsed:
+                        if isinstance(item, dict):
+                            n = str(item.get("name") or "").strip()
+                            v = str(item.get("value") or "").strip()
+                            d = str(item.get("domain") or ".google.com").strip()
+                            p = str(item.get("path") or "/").strip()
+                            if n and v:
+                                cookie_dict[n] = v
+                                cookie_list.append({"name": n, "value": v, "domain": d, "path": p})
+                    continue
+                elif isinstance(parsed, dict):
+                    for k, v in parsed.items():
+                        n, val = str(k).strip(), str(v).strip()
+                        if n and val:
+                            cookie_dict[n] = val
+                            cookie_list.append({"name": n, "value": val, "domain": ".google.com", "path": "/"})
+                    continue
+            except Exception:
+                pass
+
+        if ";" in s or ("=" in s and not s.startswith("__Secure-1PSID=")):
+            if s.lower().startswith("cookie:"):
+                s = s[7:].strip()
+            for part in s.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    if k and v:
+                        cookie_dict[k] = v
+                        cookie_list.append({"name": k, "value": v, "domain": ".google.com", "path": "/"})
+            continue
+
+        clean_single = s.replace("__Secure-1PSID=", "").rstrip(";").strip().strip('"')
+        if "|" in clean_single and not extra_ts:
+            p1, p2 = clean_single.split("|", 1)
+            clean_single, extra_ts = p1.strip(), p2.strip()
+        if clean_single:
+            cookie_dict["__Secure-1PSID"] = clean_single
+            cookie_list.append({"name": "__Secure-1PSID", "value": clean_single, "domain": ".google.com", "path": "/"})
+
+    if extra_ts:
+        clean_ts = extra_ts.replace("__Secure-1PSIDTS=", "").rstrip(";").strip().strip('"')
+        if clean_ts:
+            cookie_dict["__Secure-1PSIDTS"] = clean_ts
+            cookie_list.append({"name": "__Secure-1PSIDTS", "value": clean_ts, "domain": ".google.com", "path": "/"})
+
+    psid = cookie_dict.get("__Secure-1PSID", "")
+    psidts = cookie_dict.get("__Secure-1PSIDTS")
+    return psid, psidts, cookie_list, cookie_dict
+
+
+def extract_1psid_only(raw_psid):
+    psid, _, _, _ = parse_full_cookies_input(raw_psid)
+    return psid or str(raw_psid or "").strip()[:155]
+
+
+def inject_full_cookiejar(client):
+    """client.cookies এবং curl_cffi AsyncSession-এর CookieJar-এ ডোমেইনসহ সব কুকি বসিয়ে দেয়"""
+    full_dict = getattr(client, "_full_cookie_dict", None) or {}
+    full_list = getattr(client, "_full_cookie_list", None) or []
+    if not full_dict:
+        return
+
+    if hasattr(client, "cookies") and isinstance(client.cookies, dict):
+        client.cookies.update(full_dict)
+    else:
+        client.cookies = dict(full_dict)
+
+    session = getattr(client, "_client", None) or getattr(client, "session", None)
+    if session is not None and hasattr(session, "cookies"):
+        for item in full_list:
+            n, v = item["name"], item["value"]
+            dom = item.get("domain") or ".google.com"
+            path = item.get("path") or "/"
+            for target_dom in (dom, ".google.com", "gemini.google.com", ".googleusercontent.com"):
+                try:
+                    session.cookies.set(n, v, domain=target_dom, path=path)
+                except Exception:
+  
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # ৩২ MB পর্যন্ত বড় JSON সাপোর্ট (৫০০+ সিন)
@@ -400,36 +488,32 @@ def r2_list_video_objects(s3, slug):
 
 # ================= কুকি পুল, ক্যাশ সিডিং ও R2 অটো-সিঙ্ক =================
 def mask_cookie(psid):
-    if len(psid) <= 12:
+    real_psid, _, _, c_dict = parse_full_cookies_input(psid)
+    base = real_psid or str(psid or "").strip()
+    if len(base) <= 12:
         return "***"
-    return f"{psid[:7]}...{psid[-5:]}"
+    suffix = f" ({len(c_dict)}ck)" if len(c_dict) > 2 else ""
+    return f"{base[:7]}...{base[-5:]}{suffix}"
 
 
 def clean_cookie_input(raw_psid, raw_psidts=""):
-    cleaned = str(raw_psid or "").strip()
-    quoted = re.findall(r'"([^"]*)"', cleaned)
-    if quoted:
-        cleaned = quoted[-1].strip()
-
-    psidts = str(raw_psidts or "").strip() or None
-    if "|" in cleaned and not psidts:
-        parts = cleaned.split("|", 1)
-        cleaned = parts[0].strip()
-        psidts = parts[1].strip() or None
-
-    cleaned = cleaned.replace("__Secure-1PSID=", "").rstrip(";").strip()
-    if psidts:
-        psidts = psidts.replace("__Secure-1PSIDTS=", "").rstrip(";").strip() or None
-
-    return cleaned, psidts
+    real_psid, real_psidts, _, c_dict = parse_full_cookies_input(raw_psid, raw_psidts)
+    if not real_psid:
+        return "", None
+    # যদি ইউজার ফুল কুকি JSON বা Header পেস্ট করে থাকে, তবে সব কুকি একসাথে সেমিকোলন ফরম্যাটে R2-তে সেভ থাকবে
+    if len(c_dict) > 2:
+        full_header_str = "; ".join(f"{k}={v}" for k, v in c_dict.items())
+        return full_header_str, real_psidts
+    return real_psid, real_psidts
 
 
 def _seed_gemini_cache_file(psid, psidts):
     """R2-তে থাকা সর্বশেষ psidts লোকাল ক্যাশে লিখে দেয় যাতে রিস্টার্টের পরও সেশন অক্ষত থাকে"""
-    if not psid or not psidts:
+    real_psid = extract_1psid_only(psid)
+    if not real_psid or not psidts:
         return
     try:
-        cache_file = os.path.join(GEMINI_CACHE_DIR, f".cached_1psidts_{psid}.txt")
+        cache_file = os.path.join(GEMINI_CACHE_DIR, f".cached_1psidts_{real_psid}.txt")
         with open(cache_file, "w", encoding="utf-8") as f:
             f.write(str(psidts).strip())
     except Exception:
@@ -437,10 +521,11 @@ def _seed_gemini_cache_file(psid, psidts):
 
 
 def _read_cached_psidts(psid):
-    if not psid:
+    real_psid = extract_1psid_only(psid)
+    if not real_psid:
         return None
     try:
-        cache_file = os.path.join(GEMINI_CACHE_DIR, f".cached_1psidts_{psid}.txt")
+        cache_file = os.path.join(GEMINI_CACHE_DIR, f".cached_1psidts_{real_psid}.txt")
         if os.path.exists(cache_file):
             with open(cache_file, "r", encoding="utf-8") as f:
                 val = f.read().strip()
@@ -1462,6 +1547,17 @@ async def _call_gemini_with_pool(
             first_image = response.images[0]
             raw_bytes = None
             try:
+                raw_bytes = await run_cancellable(
+                    download_gemini_image_bytes(client, first_image),
+                    stop_event,
+                    timeout=35,
+                )
+            except InterruptedError:
+                raise
+            except Exception:
+                raw_bytes = None
+
+            if not raw_bytes:
                 await run_cancellable(
                     first_image.save(path=STORAGE_DIR, filename=temp_filename),
                     stop_event,
@@ -1470,24 +1566,6 @@ async def _call_gemini_with_pool(
                 if os.path.exists(temp_path):
                     with open(temp_path, "rb") as f:
                         raw_bytes = f.read()
-            except InterruptedError:
-                raise
-            except Exception:
-                raw_bytes = None
-
-            if not raw_bytes and getattr(first_image, "url", None):
-                r_img = await run_cancellable(
-                    asyncio.to_thread(
-                        requests.get,
-                        first_image.url,
-                        headers={"User-Agent": "Mozilla/5.0"},
-                        timeout=25,
-                    ),
-                    stop_event,
-                    timeout=30,
-                )
-                if r_img and r_img.status_code == 200 and len(r_img.content) > 500:
-                    raw_bytes = r_img.content
 
             if not raw_bytes:
                 raise RuntimeError("টেম্পোরারি ইমেজ সেভ হয়নি")
