@@ -28,15 +28,31 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 import requests
 from stream_zip import ZIP_32, stream_zip
 
-# ================= CRITICAL FIX: gemini-webapi 2.1.1 _init_rpc 400 Error & Deadlock Bypass =================
+# ================= CRITICAL FIX: gemini-webapi 2.1.1 All BatchExecute 400 Error Bypass =================
+class _DummyBatchResponse:
+    status_code = 200
+    text = ")]}'\n\n"
+    def json(self):
+        return []
+
 async def _bypass_broken_init_rpc(self, *args, **kwargs):
-    return
+    return _DummyBatchResponse()
 
 if hasattr(GeminiClient, "_init_rpc"):
     GeminiClient._init_rpc = _bypass_broken_init_rpc
 if hasattr(GeminiClient, "_fetch_user_status"):
     GeminiClient._fetch_user_status = _bypass_broken_init_rpc
-# ===========================================================================================================
+if hasattr(GeminiClient, "_batch_execute"):
+    _orig_batch_execute = GeminiClient._batch_execute
+    async def _safe_batch_execute(self, payloads, *args, **kwargs):
+        try:
+            return await _orig_batch_execute(self, payloads, *args, **kwargs)
+        except Exception as e:
+            if "400" in str(e):
+                return _DummyBatchResponse()
+            raise
+    GeminiClient._batch_execute = _safe_batch_execute
+# =======================================================================================================
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # ৩২ MB পর্যন্ত বড় JSON সাপোর্ট (৫০০+ সিন)
