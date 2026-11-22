@@ -140,7 +140,92 @@ def inject_full_cookiejar(client):
                 try:
                     session.cookies.set(n, v, domain=target_dom, path=path)
                 except Exception:
-  
+                    try:
+                        session.cookies[n] = v
+                    except Exception:
+                        pass
+
+
+def normalize_gemini_image_url(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    if not url:
+        return url
+    parts = urlsplit(url)
+    path = re.sub(r"=[a-zA-Z0-9_-]+$", "", parts.path)
+    if not path.endswith("=s0"):
+        path = f"{path}=s0"
+    q_dict = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q_dict["alr"] = "yes"
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(q_dict), parts.fragment))
+
+
+async def download_gemini_image_bytes(client, image_obj) -> bytes:
+    raw_url = getattr(image_obj, "url", None)
+    if not raw_url:
+        raise RuntimeError("ইমেজ অবজেক্টে কোনো URL পাওয়া যায়নি")
+
+    final_url = normalize_gemini_image_url(raw_url)
+    inject_full_cookiejar(client)
+
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": "https://gemini.google.com/",
+        "User-Agent": (getattr(client, "headers", None) or {}).get(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ),
+    }
+
+    session = getattr(client, "_client", None) or getattr(client, "session", None)
+    if session is not None:
+        resp = await session.get(final_url, headers=headers, cookies=client.cookies, allow_redirects=True, timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate="chrome") as tmp_sess:
+        for k, v in (client.cookies or {}).items():
+            for d in (".google.com", "gemini.google.com", ".googleusercontent.com"):
+                try:
+                    tmp_sess.cookies.set(k, v, domain=d, path="/")
+                except Exception:
+                    pass
+        resp = await tmp_sess.get(final_url, headers=headers, allow_redirects=True, timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+        raise RuntimeError(f"ইমেজ ডাউনলোড ব্যর্থ (HTTP {resp.status_code})")
+
+
+_orig_gemini_init = GeminiClient.__init__
+def _hooked_gemini_init(self, secure_1psid=None, secure_1psidts=None, *args, **kwargs):
+    real_psid, real_psidts, c_list, c_dict = parse_full_cookies_input(secure_1psid, secure_1psidts)
+    _orig_gemini_init(self, secure_1psid=real_psid or secure_1psid, secure_1psidts=real_psidts or secure_1psidts, *args, **kwargs)
+    self._full_cookie_list = c_list
+    self._full_cookie_dict = c_dict
+    if c_dict:
+        self.cookies.update(c_dict)
+
+GeminiClient.__init__ = _hooked_gemini_init
+
+if hasattr(GeminiClient, "_init_rpc"):
+    _orig_init_rpc = GeminiClient._init_rpc
+    async def _hooked_init_rpc(self, *args, **kwargs):
+        inject_full_cookiejar(self)
+        try:
+            return await _orig_init_rpc(self, *args, **kwargs)
+        except Exception as e:
+            print(f"Non-fatal _init_rpc warning ignored: {e}")
+            return None
+    GeminiClient._init_rpc = _hooked_init_rpc
+
+if hasattr(GeminiClient, "_batch_execute"):
+    _orig_batch_exec = GeminiClient._batch_execute
+    async def _hooked_batch_execute(self, payloads, *args, **kwargs):
+        inject_full_cookiejar(self)
+        kwargs["close_on_error"] = False
+        return await _orig_batch_exec(self, payloads, *args, **kwargs)
+    GeminiClient._batch_execute = _hooked_batch_execute
+
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # ৩২ MB পর্যন্ত বড় JSON সাপোর্ট (৫০০+ সিন)
