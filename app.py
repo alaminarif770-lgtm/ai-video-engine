@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import gc
 import gzip
 import hashlib
@@ -13,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 from stat import S_IFREG
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 try:
     from zoneinfo import ZoneInfo
@@ -24,22 +26,20 @@ import boto3
 from botocore.config import Config
 from flask import Flask, Response, jsonify, redirect, render_template, request, stream_with_context
 from gemini_webapi import GeminiClient
+import gemini_webapi.client as _gw_client
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 import requests
 from stream_zip import ZIP_32, stream_zip
 
+
 # ================= CRITICAL FIX: Google 20261112 Full CookieJar + Image =s0?alr=yes Fix =================
-import base64
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
-
-
 def parse_full_cookies_input(raw_input, raw_psidts=""):
     """Cookie-Editor JSON Array, JSON Dict, Raw Cookie Header কিংবা একক 1PSID স্ট্রিং পার্স করে"""
     text = str(raw_input or "").strip()
     extra_ts = str(raw_psidts or "").strip()
 
-    # যদি ইনপুটে শুধু ১টি কুকি থাকে কিন্তু Render Env-এ GEMINI_COOKIES_JSON থাকে, তবে সেটিও মার্জ করবে
-    env_json = os.environ.get("GEMINI_COOKIES_JSON", "").strip()
+    # FIX: env JSON আর অন্য অ্যাকাউন্টের কুকির সাথে মেশানো হবে না (প্রতিটি অ্যাকাউন্ট আলাদা থাকবে)
+    env_json = ""
     cookie_list = []
     cookie_dict = {}
 
@@ -118,11 +118,8 @@ def extract_1psid_only(raw_psid):
     return psid or str(raw_psid or "").strip()[:155]
 
 
-import gemini_webapi.client as _gw_client
-
-
 def inject_full_cookiejar(client):
-    """client.cookies এবং client.client (curl_cffi/httpx)-এর CookieJar-এ ডোমেইনসহ সব ২৫টি কুকি বসিয়ে দেয়"""
+    """client.cookies এবং client.client (curl_cffi)-এর CookieJar-এ ডোমেইনসহ সব ২৫টি কুকি বসিয়ে দেয়"""
     full_dict = getattr(client, "_full_cookie_dict", None) or {}
     full_list = getattr(client, "_full_cookie_list", None) or []
     if not full_dict:
@@ -133,7 +130,6 @@ def inject_full_cookiejar(client):
     else:
         client.cookies = dict(full_dict)
 
-    # gemini-webapi 2.1.1 এ সেশনের আসল নাম হলো client.client
     for attr in ("client", "_client", "session", "_session"):
         session = getattr(client, attr, None)
         if session is not None and hasattr(session, "cookies"):
@@ -167,7 +163,7 @@ def normalize_gemini_image_url(raw_url: str) -> str:
 async def download_gemini_image_bytes(client, image_obj) -> bytes:
     raw_url = getattr(image_obj, "url", None)
     if not raw_url:
-        raise RuntimeError("ইমেজ অবজেক্টে কোনো URL পাওয়া যায়নি")
+        raise RuntimeError("ইমেজ অবজেক্টে কোনো URL পাওয়া যায়নি")
 
     final_url = normalize_gemini_image_url(raw_url)
     inject_full_cookiejar(client)
@@ -207,145 +203,71 @@ async def download_gemini_image_bytes(client, image_obj) -> bytes:
         raise RuntimeError(f"ইমেজ ডাউনলোড ব্যর্থ (HTTP {resp.status_code})")
 
 
-# ১. get_access_token যাতে ২৫টি কুকি মুছে না ফেলে, সবগুলো ধরে রাখে
-if hasattr(_gw_client, "get_access_token"):
-    _orig_get_access_token = _gw_client.get_access_token
-    async def _hooked_get_access_token(*args, **kwargs):
-        token, valid_cookies = await _orig_get_access_token(*args, **kwargs)
-        base_c = kwargs.get("base_cookies") or (args[0] if args else {})
-        merged = dict(base_c or {})
-        if isinstance(valid_cookies, dict):
-            merged.update(valid_cookies)
-        return token, merged
-    _gw_client.get_access_token = _hooked_get_access_token
+def _install_gemini_hooks():
+    if hasattr(_gw_client, "get_access_token") and not getattr(_gw_client.get_access_token, "_is_my_hook", False):
+        orig_gat = _gw_client.get_access_token
+
+        async def hooked_gat(*args, **kwargs):
+            res = await orig_gat(*args, **kwargs)
+            base_c = kwargs.get("base_cookies") or (args[0] if args else None)
+            if isinstance(res, tuple) and isinstance(base_c, dict):
+                res = list(res)
+                for i in range(len(res) - 1, -1, -1):
+                    if isinstance(res[i], dict):
+                        merged = dict(base_c)
+                        merged.update(res[i])
+                        res[i] = merged
+                        break
+                return tuple(res)
+            return res
+
+        hooked_gat._is_my_hook = True
+        _gw_client.get_access_token = hooked_gat
+
+    if not getattr(GeminiClient.__init__, "_is_my_hook", False):
+        orig_init = GeminiClient.__init__
+        def hooked_init(self, secure_1psid=None, secure_1psidts=None, *args, **kwargs):
+            real_psid, real_psidts, c_list, c_dict = parse_full_cookies_input(secure_1psid, secure_1psidts)
+            orig_init(self, secure_1psid=real_psid or secure_1psid, secure_1psidts=real_psidts or secure_1psidts, *args, **kwargs)
+            self._full_cookie_list = c_list
+            self._full_cookie_dict = c_dict
+            if c_dict:
+                if hasattr(self, "cookies") and isinstance(self.cookies, dict):
+                    self.cookies.update(c_dict)
+                else:
+                    self.cookies = dict(c_dict)
+        hooked_init._is_my_hook = True
+        GeminiClient.__init__ = hooked_init
+
+    if not getattr(GeminiClient.init, "_is_my_hook", False):
+        orig_async_init = GeminiClient.init
+        async def hooked_async_init(self, *args, **kwargs):
+            if getattr(self, "_full_cookie_dict", None):
+                self.cookies.update(self._full_cookie_dict)
+            res = await orig_async_init(self, *args, **kwargs)
+            inject_full_cookiejar(self)
+            return res
+        hooked_async_init._is_my_hook = True
+        GeminiClient.init = hooked_async_init
+
+    for method_name in ("_init_rpc", "_batch_execute", "generate_content"):
+        if hasattr(GeminiClient, method_name):
+            orig_m = getattr(GeminiClient, method_name)
+            if not getattr(orig_m, "_is_my_hook", False):
+                def _make_wrapper(fn):
+                    async def wrapped(self, *args, **kwargs):
+                        inject_full_cookiejar(self)
+                        return await fn(self, *args, **kwargs)
+                    wrapped._is_my_hook = True
+                    return wrapped
+                setattr(GeminiClient, method_name, _make_wrapper(orig_m))
 
 
-# ২. GeminiClient শুরুতেই ২৫টি কুকি পার্স ও সেভ করে নেবে
-_orig_gemini_init = GeminiClient.__init__
-def _hooked_gemini_init(self, secure_1psid=None, secure_1psidts=None, *args, **kwargs):
-    real_psid, real_psidts, c_list, c_dict = parse_full_cookies_input(secure_1psid, secure_1psidts)
-    _orig_gemini_init(self, secure_1psid=real_psid or secure_1psid, secure_1psidts=real_psidts or secure_1psidts, *args, **kwargs)
-    self._full_cookie_list = c_list
-    self._full_cookie_dict = c_dict
-    if c_dict:
-        self.cookies.update(c_dict)
-
-GeminiClient.__init__ = _hooked_gemini_init
-
-_orig_gemini_async_init = GeminiClient.init
-async def _hooked_gemini_async_init(self, *args, **kwargs):
-    if getattr(self, "_full_cookie_dict", None):
-        self.cookies.update(self._full_cookie_dict)
-    res = await _orig_gemini_
-    full_dict = getattr(client, "_full_cookie_dict", None) or {}
-    full_list = getattr(client, "_full_cookie_list", None) or []
-    if not full_dict:
-        return
-
-    if hasattr(client, "cookies") and isinstance(client.cookies, dict):
-        client.cookies.update(full_dict)
-    else:
-        client.cookies = dict(full_dict)
-
-    session = getattr(client, "_client", None) or getattr(client, "session", None)
-    if session is not None and hasattr(session, "cookies"):
-        for item in full_list:
-            n, v = item["name"], item["value"]
-            dom = item.get("domain") or ".google.com"
-            path = item.get("path") or "/"
-            for target_dom in (dom, ".google.com", "gemini.google.com", ".googleusercontent.com"):
-                try:
-                    session.cookies.set(n, v, domain=target_dom, path=path)
-                except Exception:
-                    try:
-                        session.cookies[n] = v
-                    except Exception:
-                        pass
-
-
-def normalize_gemini_image_url(raw_url: str) -> str:
-    url = str(raw_url or "").strip()
-    if not url:
-        return url
-    parts = urlsplit(url)
-    path = re.sub(r"=[a-zA-Z0-9_-]+$", "", parts.path)
-    if not path.endswith("=s0"):
-        path = f"{path}=s0"
-    q_dict = dict(parse_qsl(parts.query, keep_blank_values=True))
-    q_dict["alr"] = "yes"
-    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(q_dict), parts.fragment))
-
-
-async def download_gemini_image_bytes(client, image_obj) -> bytes:
-    raw_url = getattr(image_obj, "url", None)
-    if not raw_url:
-        raise RuntimeError("ইমেজ অবজেক্টে কোনো URL পাওয়া যায়নি")
-
-    final_url = normalize_gemini_image_url(raw_url)
-    inject_full_cookiejar(client)
-
-    headers = {
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
-        "Referer": "https://gemini.google.com/",
-        "User-Agent": (getattr(client, "headers", None) or {}).get(
-            "User-Agent",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-        ),
-    }
-
-    session = getattr(client, "_client", None) or getattr(client, "session", None)
-    if session is not None:
-        resp = await session.get(final_url, headers=headers, cookies=client.cookies, allow_redirects=True, timeout=35)
-        if resp.status_code == 200 and len(resp.content) > 1000:
-            return resp.content
-
-    from curl_cffi.requests import AsyncSession
-    async with AsyncSession(impersonate="chrome") as tmp_sess:
-        for k, v in (client.cookies or {}).items():
-            for d in (".google.com", "gemini.google.com", ".googleusercontent.com"):
-                try:
-                    tmp_sess.cookies.set(k, v, domain=d, path="/")
-                except Exception:
-                    pass
-        resp = await tmp_sess.get(final_url, headers=headers, allow_redirects=True, timeout=35)
-        if resp.status_code == 200 and len(resp.content) > 1000:
-            return resp.content
-        raise RuntimeError(f"ইমেজ ডাউনলোড ব্যর্থ (HTTP {resp.status_code})")
-
-
-_orig_gemini_init = GeminiClient.__init__
-def _hooked_gemini_init(self, secure_1psid=None, secure_1psidts=None, *args, **kwargs):
-    real_psid, real_psidts, c_list, c_dict = parse_full_cookies_input(secure_1psid, secure_1psidts)
-    _orig_gemini_init(self, secure_1psid=real_psid or secure_1psid, secure_1psidts=real_psidts or secure_1psidts, *args, **kwargs)
-    self._full_cookie_list = c_list
-    self._full_cookie_dict = c_dict
-    if c_dict:
-        self.cookies.update(c_dict)
-
-GeminiClient.__init__ = _hooked_gemini_init
-
-if hasattr(GeminiClient, "_init_rpc"):
-    _orig_init_rpc = GeminiClient._init_rpc
-    async def _hooked_init_rpc(self, *args, **kwargs):
-        inject_full_cookiejar(self)
-        try:
-            return await _orig_init_rpc(self, *args, **kwargs)
-        except Exception as e:
-            print(f"Non-fatal _init_rpc warning ignored: {e}")
-            return None
-    GeminiClient._init_rpc = _hooked_init_rpc
-
-if hasattr(GeminiClient, "_batch_execute"):
-    _orig_batch_exec = GeminiClient._batch_execute
-    async def _hooked_batch_execute(self, payloads, *args, **kwargs):
-        inject_full_cookiejar(self)
-        kwargs["close_on_error"] = False
-        return await _orig_batch_exec(self, payloads, *args, **kwargs)
-    GeminiClient._batch_execute = _hooked_batch_execute
-
+_install_gemini_hooks()
+# =======================================================================================================
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024  # ৩২ MB পর্যন্ত বড় JSON সাপোর্ট (৫০০+ সিন)
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 
 
 def _load_local_config():
@@ -373,8 +295,9 @@ def get_conf(key, default=""):
     return str(default or "").strip()
 
 
-TELEGRAM_BOT_TOKEN = get_conf("TELEGRAM_BOT_TOKEN", "9286714156:AAGLSmL2HSHFcPo7ThJxTaGSBQa4mHf8aZk")
-TELEGRAM_CHAT_ID = get_conf("TELEGRAM_CHAT_ID", "6322417812")
+# FIX: সিক্রেট কোডে রাখা হয়নি। Render Environment-এ TELEGRAM_BOT_TOKEN ও TELEGRAM_CHAT_ID সেট করুন।
+TELEGRAM_BOT_TOKEN = get_conf("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = get_conf("TELEGRAM_CHAT_ID")
 
 R2_ENDPOINT = get_conf("R2_ENDPOINT")
 R2_ACCESS_KEY_ID = get_conf("R2_ACCESS_KEY_ID")
@@ -501,9 +424,10 @@ def _notify_worker_unpause():
 
 
 def _clear_gemini_cache(psid=None):
+    real_psid = extract_1psid_only(psid) if psid else None
     try:
         for fname in os.listdir(GEMINI_CACHE_DIR):
-            if psid is None or psid in fname or fname.startswith(".cached_1psidts"):
+            if real_psid is None or real_psid in fname or fname.startswith(".cached_1psidts"):
                 try:
                     os.remove(os.path.join(GEMINI_CACHE_DIR, fname))
                 except Exception:
@@ -702,7 +626,6 @@ def clean_cookie_input(raw_psid, raw_psidts=""):
     real_psid, real_psidts, _, c_dict = parse_full_cookies_input(raw_psid, raw_psidts)
     if not real_psid:
         return "", None
-    # যদি ইউজার ফুল কুকি JSON বা Header পেস্ট করে থাকে, তবে সব কুকি একসাথে সেমিকোলন ফরম্যাটে R2-তে সেভ থাকবে
     if len(c_dict) > 2:
         full_header_str = "; ".join(f"{k}={v}" for k, v in c_dict.items())
         return full_header_str, real_psidts
@@ -710,7 +633,6 @@ def clean_cookie_input(raw_psid, raw_psidts=""):
 
 
 def _seed_gemini_cache_file(psid, psidts):
-    """R2-তে থাকা সর্বশেষ psidts লোকাল ক্যাশে লিখে দেয় যাতে রিস্টার্টের পরও সেশন অক্ষত থাকে"""
     real_psid = extract_1psid_only(psid)
     if not real_psid or not psidts:
         return
@@ -739,7 +661,6 @@ def _read_cached_psidts(psid):
 
 
 def _sync_client_cookies_to_storage(cid, client):
-    """৪-৫ ঘণ্টা পর লগআউট রোধ: নতুন ঘূর্ণায়মান __Secure-1PSIDTS পেলেই মেমোরি ও R2-তে সেভ করে"""
     new_psidts = None
     psid_val = None
     try:
@@ -984,7 +905,7 @@ def bootstrap_from_r2():
         _bootstrapped = True
 
 
-# ================= ইমেজ ওয়াটারমার্ক, রেফারেন্স কোলাজ ও ভয়েসওভার টেক্সট =================
+# ================= ইমেজ ওয়াটারমার্ক, রেফারেন্স কোলাজ ও ভয়েসওভার টেক্সট =================
 def apply_watermark(image_bytes, scene_num, mode=True):
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
 
@@ -1072,8 +993,7 @@ def build_clean_voiceover_text(scenes_data):
             parts.append(narr)
     return " ".join(parts)
 
-
-# ================= নন-ব্লকিং ও ডিরেক্ট-R2 টেলিগ্রাম কিউ ওয়ার্কার =================
+# ================= নন-ব্লকিং ও ডিরেক্ট-R2 টেলিগ্রাম কিউ ওয়ার্কার =================
 tg_queue = queue.Queue(maxsize=1000)
 _tg_thread_lock = threading.Lock()
 _tg_thread = None
@@ -1183,7 +1103,7 @@ def _send_telegram_photo_url_sync(s3_cli, r2_key, scene_num, narration):
             return _send_telegram_photo_sync(img_bytes, scene_num, narration)
         finally:
             del img_bytes
-    _log_tg_failure(f"R2 থেকে ছবি লোড করা যায়নি ({r2_key})")
+    _log_tg_failure(f"R2 থেকে ছবি লোড করা যায়নি ({r2_key})")
     return False
 
 
@@ -1240,14 +1160,14 @@ def send_telegram_photo_r2_queued(r2_key, scene_num, narration):
 
 def notify_cookie_issue(name, preview, reason, level="warning"):
     icon = "🚫" if level == "critical" else "⚠️"
-    title = "কুকি অকার্যকর হয়েছে" if level == "critical" else "কুকি সতর্কতা"
+    title = "কুকি অকার্যকর হয়েছে" if level == "critical" else "কুকি সতর্কতা"
     send_telegram_message(
         f"{icon} <b>{title} ({html.escape(name)})</b> ({html.escape(preview)})\n"
         f"সমস্যা: <code>{html.escape(str(reason)[:220])}</code>"
     )
 
 
-# ================= GitHub Actions (২য় সার্ভার — ভিডিও ও বড় ZIP) ট্রিগার হেল্পার =================
+# ================= GitHub Actions (২য় সার্ভার — ভিডিও ও বড় ZIP) ট্রিগার হেল্পার =================
 def trigger_github_video_render(slug, mode="video"):
     if not GITHUB_PAT:
         return False, "Render-এ GITHUB_PAT সেট করা নেই।"
@@ -1261,7 +1181,7 @@ def trigger_github_video_render(slug, mode="video"):
                 "slug": slug,
                 "status": "queued",
                 "percent": 2,
-                "message": "২য় সার্ভারে কমান্ড পাঠানো হয়েছে, রেন্ডার শুরু হচ্ছে...",
+                "message": "২য় সার্ভারে কমান্ড পাঠানো হয়েছে, রেন্ডার শুরু হচ্ছে...",
                 "updated_at": now_utc_iso(),
             },
         )
@@ -1273,7 +1193,7 @@ def trigger_github_video_render(slug, mode="video"):
                 "slug": slug,
                 "status": "queued",
                 "percent": 5,
-                "message": "২য় সার্ভারে ZIP তৈরির কমান্ড পাঠানো হয়েছে...",
+                "message": "২য় সার্ভারে ZIP তৈরির কমান্ড পাঠানো হয়েছে...",
                 "updated_at": now_utc_iso(),
             },
         )
@@ -1291,7 +1211,7 @@ def trigger_github_video_render(slug, mode="video"):
     try:
         res = requests.post(url, headers=headers, json={"ref": GITHUB_REF, "inputs": inputs_payload}, timeout=20)
         if res.status_code in (201, 204):
-            return True, "২য় সার্ভারে কমান্ড পাঠানো হয়েছে!"
+            return True, "২য় সার্ভারে কমান্ড পাঠানো হয়েছে!"
         try:
             err_msg = res.json().get("message", res.text[:160])
         except Exception:
@@ -1313,7 +1233,7 @@ def trigger_github_video_render(slug, mode="video"):
         return False, str(e)[:150]
 
 
-# ================= কুকি টেস্ট ওয়ার্কার =================
+# ================= কুকি টেস্ট ওয়ার্কার =================
 async def _test_single_cookie_async(cookie_entry):
     cid = cookie_entry["id"]
     with state_lock:
@@ -1390,7 +1310,7 @@ async def async_test_cookies_worker(target_id=None):
 
         if not targets:
             update_state(is_testing_cookies=False, status_text="No Cookie to Test")
-            add_log("⚠️ টেস্ট করার মতো কোনো সক্রিয় কুকি পাওয়া যায়নি।")
+            add_log("⚠️ টেস্ট করার মতো কোনো সক্রিয় কুকি পাওয়া যায়নি।")
             return
 
         ok_cnt = 0
@@ -1506,7 +1426,7 @@ def _is_rate_limit_error(err_msg):
     return any(k in low for k in ("429", "too many", "rate limit", "quota", "resource exhausted"))
 
 
-# ================= কঠোর সিরিয়াল রোটেশন (১ -> ২ -> ৩ -> ৪ -> ৫ -> ১...) =================
+# ================= কঠোর সিরিয়াল রোটেশন (১ -> ২ -> ৩ -> ৪ -> ৫ -> ১...) =================
 def _pick_next_cookie():
     global rr_cursor
     now_ts = time.time()
@@ -1613,7 +1533,7 @@ async def _call_gemini_with_pool(
     temp_filename="temp_gen.jpg",
     max_attempts=3,
 ):
-    last_error = "সব চেষ্টায় ব্যর্থ"
+    last_error = "সব চেষ্টায় ব্যর্থ"
 
     for attempt in range(1, max_attempts + 1):
         if stop_event.is_set():
@@ -1696,7 +1616,7 @@ async def _call_gemini_with_pool(
                 )
                 clients_map[cid] = (client, c_ver)
                 _sync_client_cookies_to_storage(cid, client)
-                add_log(f"✅ {acc_label} কানেক্ট হয়েছে!")
+                add_log(f"✅ {acc_label} কানেক্ট হয়েছে!")
             except InterruptedError:
                 raise
             except Exception as init_err:
@@ -1725,7 +1645,7 @@ async def _call_gemini_with_pool(
             if not expect_image:
                 resp_text = (getattr(response, "text", "") or "").strip()
                 if _is_auth_error(resp_text):
-                    raise RuntimeError(f"AuthError: কুকি লগআউট হয়ে গেছে ({resp_text[:100]})")
+                    raise RuntimeError(f"AuthError: কুকি লগআউট হয়ে গেছে ({resp_text[:100]})")
                 if not resp_text:
                     _mark_cookie_success(cid)
                     last_error = "Gemini টেক্সট রেসপন্স খালি ছিল"
@@ -1738,7 +1658,7 @@ async def _call_gemini_with_pool(
             if not response or not response.images:
                 resp_text = (getattr(response, "text", "") or "").strip()[:140]
                 if _is_auth_error(resp_text):
-                    raise RuntimeError(f"AuthError: কুকি লগআউট হয়ে গেছে ({resp_text})")
+                    raise RuntimeError(f"AuthError: কুকি লগআউট হয়ে গেছে ({resp_text})")
                 _mark_cookie_success(cid)
                 last_error = f"ইমেজ আসেনি: {resp_text}" if resp_text else "Gemini ইমেজ রিটার্ন করেনি (Prompt/Filter)"
                 add_log(f"⚠️ [{acc_label}] {log_prefix}: {last_error}")
@@ -1770,7 +1690,7 @@ async def _call_gemini_with_pool(
                         raw_bytes = f.read()
 
             if not raw_bytes:
-                raise RuntimeError("টেম্পোরারি ইমেজ সেভ হয়নি")
+                raise RuntimeError("টেম্পোরারি ইমেজ সেভ হয়নি")
 
             _mark_cookie_success(cid)
             return "OK", raw_bytes, acc_label
@@ -1792,14 +1712,14 @@ async def _call_gemini_with_pool(
 
             if cd_info:
                 if cd_info[0] == "auth":
-                    add_log(f"🚫 {cd_info[1]} অকার্যকর/লগআউট হয়েছে! কুকিটি Failed হিসেবে চিহ্নিত হলো।")
+                    add_log(f"🚫 {cd_info[1]} অকার্যকর/লগআউট হয়েছে! কুকিটি Failed হিসেবে চিহ্নিত হলো।")
                     now_ts = time.time()
                     if now_ts - last_alert_at.get(cid, 0.0) > 120:
                         last_alert_at[cid] = now_ts
                         notify_cookie_issue(cd_info[1], cd_info[2], err_msg, level="critical")
                 elif cd_info[0] == "cooldown":
                     mins = int(cd_info[2] // 60)
-                    add_log(f"❄️ {cd_info[1]} কুলডাউনে গেল ({mins} মিনিট, লেভেল {cd_info[3]})। পরের একাউন্ট দিয়ে চালিয়ে নেবে।")
+                    add_log(f"❄️ {cd_info[1]} কুলডাউনে গেল ({mins} মিনিট, লেভেল {cd_info[3]})। পরের একাউন্ট দিয়ে চালিয়ে নেবে।")
 
             save_cookies_to_r2()
             if attempt < max_attempts:
@@ -1832,10 +1752,10 @@ def _extract_json_block(raw_text):
 async def _auto_analyze_old_json(s3, slug, title, scenes_data, clients_map, last_alert_at, stop_event, wakeup_event, unpause_event):
     cached = r2_read_json(s3, f"projects/{slug}/story_bible.json")
     if isinstance(cached, dict) and (cached.get("style_bible") or cached.get("characters")):
-        add_log("♻️ R2 থেকে আগে তৈরি করা Story Bible লোড হয়েছে।")
+        add_log("♻️ R2 থেকে আগে তৈরি করা Story Bible লোড হয়েছে।")
         return cached
 
-    add_log("🧠 পুরোনো JSON পাওয়া গেছে — অটোমেটিক Style ও Character শনাক্ত করা হচ্ছে...")
+    add_log("🧠 পুরোনো JSON পাওয়া গেছে — অটোমেটিক Style ও Character শনাক্ত করা হচ্ছে...")
     total = len(scenes_data)
     step = max(1, total // 40)
     samples = []
@@ -1898,10 +1818,10 @@ async def _auto_analyze_old_json(s3, slug, title, scenes_data, clients_map, last
                     result["era_keywords"] = parsed["era_keywords"]
                 add_log(
                     f"✨ Auto-Bible তৈরি: {len(result['characters'])} টি চরিত্র, "
-                    f"{len(result['eras'])} টি সময়কাল শনাক্ত হয়েছে।"
+                    f"{len(result['eras'])} টি সময়কাল শনাক্ত হয়েছে।"
                 )
         except Exception as pe:
-            add_log(f"⚠️ Auto-Analyze JSON পার্স হয়নি, Scene #1 Style Anchor ব্যবহার হবে ({str(pe)[:50]})")
+            add_log(f"⚠️ Auto-Analyze JSON পার্স হয়নি, Scene #1 Style Anchor ব্যবহার হবে ({str(pe)[:50]})")
 
     r2_write_json(s3, f"projects/{slug}/story_bible.json", result)
     return result
@@ -1961,8 +1881,7 @@ def _build_scene_prompt(prompt, ratio, style_bible, era_desc, char_labels, ref_m
     parts.append(f"Aspect ratio {ratio}")
     return " ".join(parts)
 
-
-# ================= মূল জেনারেশন ওয়ার্কার =================
+# ================= মূল জেনারেশন ওয়ার্কার =================
 async def async_generation_worker(
     scenes_data,
     title,
@@ -2059,7 +1978,7 @@ async def async_generation_worker(
     try:
         s3 = get_r2_client()
         if not s3:
-            add_log("❌ Cloudflare R2 কনফিগারেশন পাওয়া যায়নি! config.json চেক করুন।")
+            add_log("❌ Cloudflare R2 কনফিগারেশন পাওয়া যায়নি! config.json চেক করুন।")
             update_state(status_text="R2 Config Error")
             return
 
@@ -2074,7 +1993,7 @@ async def async_generation_worker(
         if not has_any_cookie:
             add_log("❌ কোনো কুকি অ্যাড করা নেই! Cookies ট্যাব থেকে কুকি অ্যাড করুন।")
             update_state(status_text="Cookie Missing Error")
-            send_telegram_message("❌ <b>প্রজেক্ট শুরু হয়নি:</b> কোনো Gemini কুকি অ্যাড করা নেই!")
+            send_telegram_message("❌ <b>প্রজেক্ট শুরু হয়নি:</b> কোনো Gemini কুকি অ্যাড করা নেই!")
             return
 
         voiceover_text = build_clean_voiceover_text(scenes_data)
@@ -2139,7 +2058,7 @@ async def async_generation_worker(
             add_log(f"♻️ R2-তে আগে থেকেই {len(existing_jpgs)} টি ছবি আছে (অটো-রিজিউম চালু)।")
 
         _sync_job_progress(s3, "running")
-        send_telegram_message(f"🚀 <b>{html.escape(title)}</b>\nমোট সিন: {total}\nকাজ শুরু হয়েছে!")
+        send_telegram_message(f"🚀 <b>{html.escape(title)}</b>\nমোট সিন: {total}\nকাজ শুরু হয়েছে!")
 
         # ================= কনসিস্টেন্সি ও রেফারেন্স পোর্ট্রেট সেটআপ =================
         auto_bible = {"style_bible": style_bible, "eras": eras_map, "characters": chars_map, "char_keywords": {}, "era_keywords": {}}
@@ -2184,7 +2103,7 @@ async def async_generation_worker(
                         with open(local_ref, "wb") as rf:
                             rf.write(data_bytes)
                         ref_paths[ckey] = local_ref
-                        add_log(f"♻️ R2 থেকে '{ckey}' রেফারেন্স রিস্টোর হয়েছে।")
+                        add_log(f"♻️ R2 থেকে '{ckey}' রেফারেন্স রিস্টোর হয়েছে।")
                         continue
 
                 ref_prompt = (
@@ -2218,10 +2137,10 @@ async def async_generation_worker(
                         timeout=25,
                     )
                     ref_paths[ckey] = local_ref
-                    add_log(f"✅ '{ckey}' মাস্টার রেফারেন্স সেভ হয়েছে!")
+                    add_log(f"✅ '{ckey}' মাস্টার রেফারেন্স সেভ হয়েছে!")
                     del r_bytes
                 else:
-                    add_log(f"⚠️ '{ckey}' রেফারেন্স তৈরি করা যায়নি: {r_err}")
+                    add_log(f"⚠️ '{ckey}' রেফারেন্স তৈরি করা যায়নি: {r_err}")
 
         style_anchor_local = os.path.join(proj_refs_dir, "_style_anchor.jpg")
         style_anchor_r2 = f"projects/{slug}/_refs/_style_anchor.jpg"
@@ -2236,7 +2155,7 @@ async def async_generation_worker(
             if sa_bytes:
                 with open(style_anchor_local, "wb") as sf:
                     sf.write(sa_bytes)
-                add_log("♻️ R2 থেকে Style Anchor ইমেজ রিস্টোর হয়েছে।")
+                add_log("♻️ R2 থেকে Style Anchor ইমেজ রিস্টোর হয়েছে।")
 
         # ================= একক সিন জেনারেশন হেল্পার =================
         aborted_no_cookies = False
@@ -2341,7 +2260,7 @@ async def async_generation_worker(
                             stop_event,
                             timeout=25,
                         )
-                        add_log(f"📌 সিন #{num:03d}-কে Style Anchor হিসেবে R2-তে সেভ করা হয়েছে।")
+                        add_log(f"📌 সিন #{num:03d}-কে Style Anchor হিসেবে R2-তে সেভ করা হয়েছে।")
                     except Exception:
                         pass
 
@@ -2356,15 +2275,15 @@ async def async_generation_worker(
 
                 elapsed = round(time.time() - t_start, 1)
                 completed_nums.add(num)
-                add_log(f"✅ [{gen_info}] সিন #{num:03d} সম্পন্ন ({elapsed}s) -> R2 & Telegram কিউতে পাঠানো হয়েছে!")
+                add_log(f"✅ [{gen_info}] সিন #{num:03d} সম্পন্ন ({elapsed}s) -> R2 & Telegram কিউতে পাঠানো হয়েছে!")
                 _sync_job_progress(s3, "running")
                 del raw_bytes, processed_bytes
                 return True
             else:
-                reason = str(gen_info or "সব চেষ্টায় ব্যর্থ")
+                reason = str(gen_info or "সব চেষ্টায় ব্যর্থ")
                 failed_scenes_list.append({"scene_number": num, "reason": reason, "prompt": prompt[:180]})
                 _sync_job_progress(s3, "running")
-                add_log(f"❌ সিন #{num:03d} বাতিল হয়েছে -> কারণ: {reason}")
+                add_log(f"❌ সিন #{num:03d} বাতিল হয়েছে -> কারণ: {reason}")
                 return False
 
         # ================= মূল সিন লুপ =================
@@ -2413,7 +2332,7 @@ async def async_generation_worker(
         if auto_video and failed_scenes_list and not stop_event.is_set() and not aborted_no_cookies:
             retry_items = list(failed_scenes_list)
             failed_scenes_list.clear()
-            add_log(f"♻️ অটো-ভিডিও চেক: ব্যর্থ হওয়া {len(retry_items)} টি সিন ১ বার অটো-রিট্রাই করা হচ্ছে...")
+            add_log(f"♻️ অটো-ভিডিও চেক: ব্যর্থ হওয়া {len(retry_items)} টি সিন ১ বার অটো-রিট্রাই করা হচ্ছে...")
 
             for r_item in retry_items:
                 if stop_event.is_set() or aborted_no_cookies:
@@ -2459,7 +2378,7 @@ async def async_generation_worker(
 
         if failed_scenes_list:
             failed_nums_str = ", ".join(f"#{f['scene_number']:03d}" for f in failed_scenes_list)
-            add_log(f"📋 বাতিল হওয়া সিন ({len(failed_scenes_list)} টি): {failed_nums_str}", level="fail")
+            add_log(f"📋 বাতিল হওয়া সিন ({len(failed_scenes_list)} টি): {failed_nums_str}", level="fail")
 
         if final_status == "completed":
             add_log(
@@ -2467,11 +2386,11 @@ async def async_generation_worker(
                 f"(আগের স্কিপ: {skipped_count}, বাতিল: {len(failed_scenes_list)})"
             )
             summary_msg = (
-                f"🎉 <b>{html.escape(title)}</b> সম্পন্ন হয়েছে!\n\n"
+                f"🎉 <b>{html.escape(title)}</b> সম্পন্ন হয়েছে!\n\n"
                 f"✅ সফল/মোট: {len(completed_nums)} / {total}\n"
                 f"⏭️ স্কিপ (আগে ছিল): {skipped_count}\n"
                 f"❌ বাতিল/ব্যর্থ: {len(failed_scenes_list)}\n"
-                f"🎙️ ভয়েসওভার স্ক্রিপ্ট: <code>story.txt</code> রেডি\n"
+                f"🎙️ ভয়েসওভার স্ক্রিপ্ট: <code>story.txt</code> রেডি\n"
             )
             if failed_scenes_list:
                 f_nums = ", ".join(f"#{f['scene_number']:03d}" for f in failed_scenes_list[:20])
@@ -2483,27 +2402,27 @@ async def async_generation_worker(
             # ================= Phase-2: Auto-Video Trigger =================
             if auto_video:
                 if failed_scenes_list:
-                    add_log("🚫 অটো-ভিডিও থামানো হয়েছে: রিট্রাই করার পরও কিছু সিন ব্যর্থ থাকায় ভিডিও শুরু করা হয়নি।", level="fail")
+                    add_log("🚫 অটো-ভিডিও থামানো হয়েছে: রিট্রাই করার পরও কিছু সিন ব্যর্থ থাকায় ভিডিও শুরু করা হয়নি।", level="fail")
                     send_telegram_message(
-                        f"⚠️ <b>অটো-ভিডিও থামানো হয়েছে ({html.escape(title)})</b>\n"
-                        f"১ বার রিট্রাই করার পরও {len(failed_scenes_list)} টি সিন ব্যর্থ রয়েছে।\n"
-                        f"ম্যানুয়ালি ব্যর্থ সিন ঠিক করে Videos ট্যাব থেকে Create Video চাপুন।"
+                        f"⚠️ <b>অটো-ভিডিও থামানো হয়েছে ({html.escape(title)})</b>\n"
+                        f"১ বার রিট্রাই করার পরও {len(failed_scenes_list)} টি সিন ব্যর্থ রয়েছে।\n"
+                        f"ম্যানুয়ালি ব্যর্থ সিন ঠিক করে Videos ট্যাব থেকে Create Video চাপুন।"
                     )
                 else:
                     vid_objs = r2_list_video_objects(s3, slug)
                     has_audio = any(o["name"].lower().endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg")) for o in vid_objs)
                     if not has_audio:
-                        add_log("⚠️ অটো-ভিডিও চালু করা যায়নি: প্রজেক্টে ভয়েসওভার অডিও আপলোড করা নেই।", level="warn")
+                        add_log("⚠️ অটো-ভিডিও চালু করা যায়নি: প্রজেক্টে ভয়েসওভার অডিও আপলোড করা নেই।", level="warn")
                         send_telegram_message(
-                            f"⚠️ <b>অটো-ভিডিও শুরু হয়নি ({html.escape(title)})</b>\n"
-                            f"সব ছবি তৈরি হয়েছে, কিন্তু ভয়েসওভার অডিও আপলোড করা ছিল না। Videos ট্যাব থেকে অডিও দিয়ে Create Video চাপুন।"
+                            f"⚠️ <b>অটো-ভিডিও শুরু হয়নি ({html.escape(title)})</b>\n"
+                            f"সব ছবি তৈরি হয়েছে, কিন্তু ভয়েসওভার অডিও আপলোড করা ছিল না। Videos ট্যাব থেকে অডিও দিয়ে Create Video চাপুন।"
                         )
                     else:
                         ok_trig, trig_msg = trigger_github_video_render(slug, mode="video")
                         if ok_trig:
-                            add_log("🎬 সব সিন সফল! ২য় সার্ভারে অটো-ভিডিও রেন্ডার শুরু হয়েছে!")
+                            add_log("🎬 সব সিন সফল! ২য় সার্ভারে অটো-ভিডিও রেন্ডার শুরু হয়েছে!")
                             send_telegram_message(
-                                f"🎬 <b>অটো-ভিডিও রেন্ডার শুরু হয়েছে!</b>\n"
+                                f"🎬 <b>অটো-ভিডিও রেন্ডার শুরু হয়েছে!</b>\n"
                                 f"প্রজেক্ট: <b>{html.escape(title)}</b>\n"
                                 f"ভিডিও তৈরি হলেই টেলিগ্রামে জানানো হবে।"
                             )
@@ -2511,15 +2430,15 @@ async def async_generation_worker(
                             add_log(f"❌ অটো-ভিডিও ট্রিগার ব্যর্থ: {trig_msg}", level="fail")
                             send_telegram_message(f"❌ <b>অটো-ভিডিও ট্রিগার ব্যর্থ ({html.escape(title)}):</b> {html.escape(trig_msg)}")
         else:
-            add_log(f"🛑 কাজ থামানো হয়েছে। সম্পন্ন: {len(completed_nums)}/{total}, বাতিল: {len(failed_scenes_list)}")
+            add_log(f"🛑 কাজ থামানো হয়েছে। সম্পন্ন: {len(completed_nums)}/{total}, বাতিল: {len(failed_scenes_list)}")
             send_telegram_message(
-                f"🛑 <b>{html.escape(title)}</b> থামানো হয়েছে।\n"
+                f"🛑 <b>{html.escape(title)}</b> থামানো হয়েছে।\n"
                 f"✅ সেভ আছে: {len(completed_nums)} / {total}\n"
                 f"❌ বাতিল: {len(failed_scenes_list)}"
             )
 
     except InterruptedError:
-        add_log("🛑 ইউজার নির্দেশে কাজ থামানো হয়েছে।")
+        add_log("🛑 ইউজার নির্দেশে কাজ থামানো হয়েছে।")
         update_state(status_text="Stopped", active_account="-", is_paused=False)
         try:
             _sync_job_progress(get_r2_client(), "stopped")
@@ -2565,7 +2484,6 @@ def generation_worker(scenes_data, title, ratio, watermark_mode, target_scene_nu
         )
     finally:
         loop.close()
-
 
 # ================= Flask রুটস =================
 @app.route("/")
@@ -2629,11 +2547,12 @@ def api_add_cookie():
     custom_name = str(data.get("name", "")).strip()
 
     if not psid or len(psid) < 20:
-        return jsonify({"error": "সঠিক __Secure-1PSID কুকি দিন!"}), 400
+        return jsonify({"error": "সঠিক __Secure-1PSID অথবা কুকি JSON দিন!"}), 400
 
+    new_core_psid = extract_1psid_only(psid)
     with state_lock:
         for existing in cookie_pool:
-            if existing["psid"] == psid:
+            if extract_1psid_only(existing["psid"]) == new_core_psid:
                 return jsonify({"error": f"এই কুকিটি আগে থেকেই '{existing['name']}' নামে অ্যাড করা আছে!"}), 400
 
         if custom_name and _cookie_name_exists(custom_name):
@@ -2650,15 +2569,15 @@ def api_add_cookie():
     _notify_worker_wakeup()
 
     if running_now:
-        add_log(f"➕ নতুন সহযোগী কুকি অ্যাড হয়েছে: {final_name} ({record['preview']}) — সিরিয়ালে যুক্ত হয়েছে!")
+        add_log(f"➕ নতুন সহযোগী কুকি অ্যাড হয়েছে: {final_name} ({record['preview']}) — সিরিয়ালে যুক্ত হয়েছে!")
     else:
-        add_log(f"➕ নতুন কুকি অ্যাড হয়েছে: {final_name} ({record['preview']})")
+        add_log(f"➕ নতুন কুকি অ্যাড হয়েছে: {final_name} ({record['preview']})")
         if not testing_now:
             threading.Thread(target=test_cookies_worker, args=(record["id"],), daemon=True).start()
 
     return jsonify({
         "status": "added",
-        "message": f"{final_name} সফলভাবে অ্যাড হয়েছে!" + (" চলমান প্রজেক্টে পরের সিরিয়ালে কাজে নামবে।" if running_now else ""),
+        "message": f"{final_name} সফলভাবে অ্যাড হয়েছে!" + (" চলমান প্রজেক্টে পরের সিরিয়ালে কাজে নামবে।" if running_now else ""),
     })
 
 
@@ -2693,932 +2612,14 @@ def api_edit_cookie(cookie_id):
         if raw_psid:
             cleaned_psid, cleaned_psidts = clean_cookie_input(raw_psid, raw_psidts)
             if len(cleaned_psid) < 20:
-                return jsonify({"error": "নতুন __Secure-1PSID কুকিটি সঠিক নয়!"}), 400
+                return jsonify({"error": "নতুন কুকিটি সঠিক নয়!"}), 400
+            new_core_psid = extract_1psid_only(cleaned_psid)
             for other in cookie_pool:
-                if other["id"] != cookie_id and other["psid"] == cleaned_psid:
+                if other["id"] != cookie_id and extract_1psid_only(other["psid"]) == new_core_psid:
                     return jsonify({"error": f"এই কুকিটি আগে থেকেই '{other['name']}' নামে আছে!"}), 400
             target["psid"] = cleaned_psid
             target["preview"] = mask_cookie(cleaned_psid)
             if cleaned_psidts:
                 target["psidts"] = cleaned_psidts
             elif clear_psidts:
-                target["psidts"] = None
-            target["status"] = "standby" if target.get("enabled", True) else "paused"
-            target["consecutive_fails"] = 0
-            target["cooldown_level"] = 0
-            target["cooldown_until"] = 0.0
-            target["cooldown_probe"] = False
-            target["last_error"] = ""
-            target["version"] = target.get("version", 1) + 1
-            new_psid_clean = cleaned_psid
-            final_psidts = target.get("psidts")
-        else:
-            if clear_psidts:
-                target["psidts"] = None
-                target["version"] = target.get("version", 1) + 1
-                _clear_gemini_cache(old_psid)
-            elif raw_psidts:
-                _, cleaned_psidts = clean_cookie_input("dummy", raw_psidts)
-                target["psidts"] = cleaned_psidts
-                target["version"] = target.get("version", 1) + 1
-                _seed_gemini_cache_file(old_psid, cleaned_psidts)
-
-    if new_psid_clean:
-        _clear_gemini_cache(old_psid)
-        _clear_gemini_cache(new_psid_clean)
-        if final_psidts:
-            _seed_gemini_cache_file(new_psid_clean, final_psidts)
-
-    save_cookies_to_r2()
-    _notify_worker_wakeup()
-    add_log(f"✏️ কুকি আপডেট হয়েছে: {old_name} → {new_name}")
-    return jsonify({"status": "updated", "message": f"{new_name} আপডেট হয়েছে!"})
-
-
-@app.route("/api/cookies/delete/<cookie_id>", methods=["POST"])
-def api_delete_cookie(cookie_id):
-    bootstrap_from_r2()
-    removed_name = None
-    removed_psid = None
-    with state_lock:
-        for i, c in enumerate(cookie_pool):
-            if c["id"] == cookie_id:
-                removed_name = c["name"]
-                removed_psid = c["psid"]
-                cookie_pool.pop(i)
-                break
-    if not removed_name:
-        return jsonify({"error": "Cookie not found"}), 404
-
-    _clear_gemini_cache(removed_psid)
-    save_cookies_to_r2()
-    add_log(f"🗑️ কুকি ডিলিট করা হয়েছে: {removed_name}")
-    return jsonify({"status": "deleted"})
-
-
-@app.route("/api/cookies/toggle/<cookie_id>", methods=["POST"])
-def api_toggle_cookie(cookie_id):
-    bootstrap_from_r2()
-    new_enabled = None
-    cname = ""
-    with state_lock:
-        for c in cookie_pool:
-            if c["id"] == cookie_id:
-                new_enabled = not c.get("enabled", True)
-                c["enabled"] = new_enabled
-                c["status"] = "standby" if new_enabled else "paused"
-                cname = c["name"]
-                break
-    if new_enabled is None:
-        return jsonify({"error": "Cookie not found"}), 404
-
-    save_cookies_to_r2()
-    if new_enabled:
-        _notify_worker_wakeup()
-        add_log(f"▶️ {cname} আবার সক্রিয় করা হয়েছে।")
-    else:
-        add_log(f"⏸️ {cname} সাময়িক Pause করা হয়েছে।")
-    return jsonify({"status": "updated", "enabled": new_enabled})
-
-
-@app.route("/api/cookies/reset/<cookie_id>", methods=["POST"])
-def api_reset_cookie(cookie_id):
-    bootstrap_from_r2()
-    cname = None
-    psid = None
-    psidts = None
-    with state_lock:
-        for c in cookie_pool:
-            if c["id"] == cookie_id:
-                c["cooldown_until"] = 0.0
-                c["cooldown_level"] = 0
-                c["consecutive_fails"] = 0
-                c["cooldown_probe"] = False
-                c["last_error"] = ""
-                c["status"] = "standby" if c.get("enabled", True) else "paused"
-                cname = c["name"]
-                psid = c["psid"]
-                psidts = c.get("psidts")
-                break
-    if not cname:
-        return jsonify({"error": "Cookie not found"}), 404
-
-    _clear_gemini_cache(psid)
-    if psidts:
-        _seed_gemini_cache_file(psid, psidts)
-    save_cookies_to_r2()
-    _notify_worker_wakeup()
-    add_log(f"🔄 {cname}-এর কুলডাউন/এরর রিসেট করা হয়েছে।")
-    return jsonify({"status": "reset"})
-
-
-@app.route("/api/cookies/test/<cookie_id>", methods=["POST"])
-def api_test_single_cookie(cookie_id):
-    bootstrap_from_r2()
-    with state_lock:
-        if state["is_running"]:
-            return jsonify({"error": "কাজ চলাকালীন আলাদা টেস্ট করা যাবে না।"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট ইতিমধ্যেই চলছে..."}), 400
-        exists = any(c["id"] == cookie_id for c in cookie_pool)
-
-    if not exists:
-        return jsonify({"error": "Cookie not found"}), 404
-
-    threading.Thread(target=test_cookies_worker, args=(cookie_id,), daemon=True).start()
-    return jsonify({"status": "testing"})
-
-
-@app.route("/api/test-cookies", methods=["POST"])
-def api_test_cookies():
-    bootstrap_from_r2()
-    with state_lock:
-        if state["is_running"]:
-            return jsonify({"error": "কাজ চলাকালীন কুকি টেস্ট করা যাবে না।"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট ইতিমধ্যেই চলছে..."}), 400
-
-    threading.Thread(target=test_cookies_worker, daemon=True).start()
-    return jsonify({"status": "testing"})
-
-
-# ================= স্টার্ট / পজ / রিজিউম / স্টপ API =================
-@app.route("/api/start", methods=["POST"])
-def start_pipeline():
-    bootstrap_from_r2()
-    with state_lock:
-        if state["is_running"]:
-            return jsonify({"error": "একটি কাজ ইতিমধ্যেই চলছে!"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট শেষ হওয়া পর্যন্ত একটু অপেক্ষা করুন।"}), 400
-        if not any(c.get("enabled", True) for c in cookie_pool):
-            return jsonify({"error": "কোনো সক্রিয় কুকি নেই! Cookies ট্যাব থেকে কুকি অ্যাড বা Resume করুন।"}), 400
-        state["should_stop"] = False
-        state["is_paused"] = False
-
-    payload = request.get_json(silent=True)
-    if not isinstance(payload, dict):
-        return jsonify({"error": "Invalid JSON request body."}), 400
-
-    raw_json = payload.get("json_content", "")
-    ratio = str(payload.get("aspect_ratio", "16:9"))
-    watermark_mode = payload.get("watermark", "hash")
-    consistency_mode = str(payload.get("consistency_mode", "auto")).strip().lower()
-    auto_video = bool(payload.get("auto_video", False))
-
-    try:
-        parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-    except Exception as e:
-        return jsonify({"error": f"Invalid JSON syntax: {str(e)}"}), 400
-
-    if not isinstance(parsed, dict):
-        return jsonify({"error": "JSON অবশ্যই একটি অবজেক্ট {...} হতে হবে।"}), 400
-
-    scenes = parsed.get("scenes")
-    if not isinstance(scenes, list) or len(scenes) == 0:
-        return jsonify({"error": "JSON-এ ভ্যালিড 'scenes' লিস্ট পাওয়া যায়নি।"}), 400
-
-    title = str(parsed.get("project_title") or "Untitled Story").strip()
-    story_cfg = {
-        "consistency_mode": consistency_mode,
-        "auto_video": auto_video,
-        "style_bible": str(parsed.get("style_bible") or "").strip(),
-        "eras": parsed.get("eras") if isinstance(parsed.get("eras"), dict) else {},
-        "characters": parsed.get("characters") if isinstance(parsed.get("characters"), dict) else {},
-    }
-
-    threading.Thread(
-        target=generation_worker,
-        args=(scenes, title, ratio, watermark_mode, None, story_cfg),
-        daemon=True,
-).start()
-
-    return jsonify({"status": "success", "total_scenes": len(scenes), "slug": make_project_slug(title)})
-
-
-@app.route("/api/pause", methods=["POST"])
-def pause_pipeline():
-    with state_lock:
-        if not state["is_running"]:
-            return jsonify({"error": "কোনো কাজ চলছে না।"}), 400
-        if not state["is_paused"]:
-            state["is_paused"] = True
-            state["status_text"] = "Pausing after current step..."
-    _notify_worker_wakeup()
-    add_log("⏸️ ইউজার নির্দেশে কাজ Pause করা হয়েছে।")
-    return jsonify({"status": "paused"})
-
-
-@app.route("/api/resume", methods=["POST"])
-def resume_pipeline():
-    with state_lock:
-        if not state["is_running"]:
-            return jsonify({"error": "কোনো কাজ চলছে না।"}), 400
-        if state["is_paused"]:
-            state["is_paused"] = False
-            state["status_text"] = "Resuming..."
-    _notify_worker_unpause()
-    add_log("▶️ কাজ আবার Resume করা হয়েছে।")
-    return jsonify({"status": "resumed"})
-
-
-@app.route("/api/stop", methods=["POST"])
-def stop_pipeline():
-    with state_lock:
-        if state["is_running"]:
-            state["should_stop"] = True
-            state["is_paused"] = False
-            state["status_text"] = "Stopping..."
-            loop = worker_control.get("loop")
-            ev = worker_control.get("stop_event")
-            if loop and ev and not loop.is_closed():
-                try:
-                    loop.call_soon_threadsafe(ev.set)
-                except Exception:
-                    pass
-            return jsonify({"status": "stopping"})
-    return jsonify({"status": "idle"})
-
-
-# ================= হিস্ট্রি ও রিজিউম / রিট্রাই API =================
-@app.route("/api/history", methods=["GET"])
-def api_get_history():
-    bootstrap_from_r2()
-    with state_lock:
-        items = list(history_cache)
-    return jsonify({"history": items})
-
-
-@app.route("/api/history/resume/<slug>", methods=["POST"])
-def api_resume_history(slug):
-    bootstrap_from_r2()
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-
-    with state_lock:
-        if state["is_running"]:
-            return jsonify({"error": "আরেকটি কাজ ইতিমধ্যেই চলছে!"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট শেষ হওয়া পর্যন্ত অপেক্ষা করুন।"}), 400
-        if not any(c.get("enabled", True) for c in cookie_pool):
-            return jsonify({"error": "কোনো সক্রিয় কুকি নেই! আগে Cookies ট্যাবে কুকি দিন।"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "Cloudflare R2 কনফিগার করা নেই।"}), 500
-
-    input_doc = r2_read_json(s3, f"projects/{slug}/input_scenes.json")
-    if not input_doc or not isinstance(input_doc.get("scenes"), list):
-        return jsonify({"error": "এই প্রজেক্টের ইনপুট সিন ডেটা R2-তে পাওয়া যায়নি।"}), 404
-
-    payload = request.get_json(silent=True) or {}
-    mode = payload.get("mode", "remaining")
-
-    target_nums = None
-    if mode == "failed_only":
-        job_doc = r2_read_json(s3, f"projects/{slug}/job_state.json") or {}
-        failed_list = job_doc.get("failed_scenes", [])
-        target_nums = {int(f["scene_number"]) for f in failed_list if "scene_number" in f}
-        if not target_nums:
-            return jsonify({"error": "রিজিউম করার মতো কোনো বাতিল হওয়া সিন নেই!"}), 400
-
-    with state_lock:
-        state["should_stop"] = False
-        state["is_paused"] = False
-
-    title = input_doc.get("project_title") or slug
-    ratio = input_doc.get("aspect_ratio") or "16:9"
-    wm = input_doc.get("watermark", "hash")
-    scenes = input_doc["scenes"]
-    story_cfg = {
-        "consistency_mode": input_doc.get("consistency_mode", "auto"),
-        "auto_video": bool(input_doc.get("auto_video", False)),
-        "style_bible": input_doc.get("style_bible", ""),
-        "eras": input_doc.get("eras", {}),
-        "characters": input_doc.get("characters", {}),
-    }
-
-    threading.Thread(
-        target=generation_worker,
-        args=(scenes, title, ratio, wm, target_nums, story_cfg),
-        daemon=True,
-    ).start()
-
-    return jsonify({"status": "resumed", "mode": mode})
-
-
-@app.route("/api/history/delete/<slug>", methods=["POST"])
-def api_delete_history(slug):
-    bootstrap_from_r2()
-    with state_lock:
-        before = len(history_cache)
-        history_cache[:] = [h for h in history_cache if h.get("slug") != slug]
-        removed = len(history_cache) < before
-    if removed:
-        save_history_to_r2()
-    return jsonify({"status": "deleted"})
-
-
-# ================= Phase-2: ভিডিও রেন্ডার ও ডাইরেক্ট R2 Presigned API =================
-@app.route("/api/video/slug", methods=["POST"])
-def api_video_slug():
-    data = request.get_json(silent=True) or {}
-    title = str(data.get("title") or "Untitled Story").strip()
-    return jsonify({"slug": make_project_slug(title)})
-
-
-@app.route("/api/video/presign-upload", methods=["POST"])
-def api_video_presign_upload():
-    data = request.get_json(silent=True) or {}
-    slug = str(data.get("slug", "")).strip()
-    kind = str(data.get("kind", "")).strip().lower()
-    filename = str(data.get("filename", "")).strip()
-    content_type = str(data.get("content_type") or "application/octet-stream").strip()
-
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    if kind not in ("audio", "srt", "font"):
-        return jsonify({"error": "Invalid upload kind"}), 400
-
-    ext = os.path.splitext(filename)[1].lower()
-    valid_exts = {
-        "audio": {".mp3", ".wav", ".m4a", ".aac", ".ogg"},
-        "srt": {".srt"},
-        "font": {".ttf", ".otf"},
-    }
-    if ext not in valid_exts[kind]:
-        return jsonify({"error": f"ভুল ফাইল ফরম্যাট ({ext})!"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 কনফিগার করা নেই।"}), 500
-
-    existing = r2_list_video_objects(s3, slug)
-    for item in existing:
-        if os.path.splitext(item["name"])[1].lower() in valid_exts[kind]:
-            try:
-                s3.delete_object(Bucket=R2_BUCKET_NAME, Key=item["key"])
-            except Exception:
-                pass
-
-    target_name = f"audio{ext}" if kind == "audio" else ("subtitles.srt" if kind == "srt" else f"font{ext}")
-    r2_key = f"projects/{slug}/_video/{target_name}"
-
-    try:
-        upload_url = s3.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": R2_BUCKET_NAME,
-                "Key": r2_key,
-                "ContentType": content_type,
-            },
-            ExpiresIn=3600,
-        )
-        return jsonify({"upload_url": upload_url, "key": r2_key, "content_type": content_type})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/video/project/<slug>", methods=["GET"])
-def api_video_project_detail(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    objs = r2_list_video_objects(s3, slug)
-    audio_file = next((o["name"] for o in objs if o["name"].lower().endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg"))), None)
-    srt_file = next((o["name"] for o in objs if o["name"].lower().endswith(".srt")), None)
-    font_file = next((o["name"] for o in objs if o["name"].lower().endswith((".ttf", ".otf"))), None)
-    mp4_obj = next((o for o in objs if o["name"] == "final_video.mp4"), None)
-
-    cfg = r2_read_json(s3, f"projects/{slug}/_video/video_config.json", default={}) or {}
-    status_doc = r2_read_json(s3, f"projects/{slug}/_video/video_status.json", default={}) or {}
-
-    return jsonify({
-        "slug": slug,
-        "audio_file": audio_file,
-        "srt_file": srt_file,
-        "font_file": font_file,
-        "has_video": bool(mp4_obj),
-        "video_size": mp4_obj["size"] if mp4_obj else 0,
-        "config": cfg,
-        "status": status_doc,
-    })
-
-
-@app.route("/api/video/config/<slug>", methods=["POST"])
-def api_video_save_config(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    data = request.get_json(silent=True) or {}
-    cfg = {
-        "auto_video": bool(data.get("auto_video", False)),
-        "quality": str(data.get("quality") or "1080p"),
-        "aspect_ratio": str(data.get("aspect_ratio") or ""),
-        "motion_mode": str(data.get("motion_mode") or "auto"),
-        "transition_type": str(data.get("transition_type") or "crossfade"),
-        "transition_duration": float(data.get("transition_duration") if data.get("transition_duration") is not None else 0.45),
-        "subtitle_enabled": bool(data.get("subtitle_enabled", True)),
-        "font_size": int(data.get("font_size") or 50),
-        "font_bold": bool(data.get("font_bold", False)),
-        "text_color": str(data.get("text_color") or "#FFFFFF"),
-        "plate_enabled": bool(data.get("plate_enabled", True)),
-        "plate_mode": str(data.get("plate_mode") or "box"),
-        "plate_color": str(data.get("plate_color") or "#000000"),
-        "plate_opacity": float(data.get("plate_opacity") if data.get("plate_opacity") is not None else 0.70),
-        "plate_padding": int(data.get("plate_padding") if data.get("plate_padding") is not None else 16),
-        "position": str(data.get("position") or "bottom"),
-        "margin_v": int(data.get("margin_v") if data.get("margin_v") is not None else 60),
-        "updated_at": now_utc_iso(),
-    }
-    if r2_write_json(s3, f"projects/{slug}/_video/video_config.json", cfg):
-        return jsonify({"status": "saved", "config": cfg})
-    return jsonify({"error": "Config সেভ করা যায়নি"}), 500
-
-
-@app.route("/api/video/trigger/<slug>", methods=["POST"])
-def api_video_trigger(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    input_doc = r2_read_json(s3, f"projects/{slug}/input_scenes.json")
-    if not input_doc or not isinstance(input_doc.get("scenes"), list):
-        return jsonify({"error": "এই প্রজেক্টের সিন বা ছবি এখনো তৈরি হয়নি!"}), 400
-
-    vid_objs = r2_list_video_objects(s3, slug)
-    has_audio = any(o["name"].lower().endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg")) for o in vid_objs)
-    if not has_audio:
-        return jsonify({"error": "আগে ভয়েসওভার অডিও (.mp3/.wav) আপলোড করুন!"}), 400
-
-    ok, msg = trigger_github_video_render(slug, mode="video")
-    if ok:
-        return jsonify({"status": "triggered", "message": msg})
-    return jsonify({"error": msg}), 500
-
-
-@app.route("/api/video/list", methods=["GET"])
-def api_video_list():
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    projects = {}
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="projects/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                parts = key.split("/")
-                if len(parts) < 3 or not parts[2]:
-                    continue
-                slug = parts[1]
-                if slug not in projects:
-                    projects[slug] = {
-                        "slug": slug,
-                        "title": slug,
-                        "image_count": 0,
-                        "has_meta": False,
-                        "has_audio": False,
-                        "has_srt": False,
-                        "has_font": False,
-                        "has_video": False,
-                        "video_size": 0,
-                        "last_modified": "",
-                        "has_video_status": False,
-                    }
-                p = projects[slug]
-                lm = obj["LastModified"].strftime("%Y-%m-%d %H:%M")
-                if lm > p["last_modified"]:
-                    p["last_modified"] = lm
-
-                if len(parts) == 3:
-                    fname = parts[2]
-                    if fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                        p["image_count"] += 1
-                    elif fname == "meta.json":
-                        p["has_meta"] = True
-                elif len(parts) == 4 and parts[2] == "_video":
-                    vname = parts[3].lower()
-                    if vname.endswith((".mp3", ".wav", ".m4a", ".aac", ".ogg")):
-                        p["has_audio"] = True
-                    elif vname.endswith(".srt"):
-                        p["has_srt"] = True
-                    elif vname.endswith((".ttf", ".otf")):
-                        p["has_font"] = True
-                    elif vname == "final_video.mp4":
-                        p["has_video"] = True
-                        p["video_size"] = obj.get("Size", 0)
-                    elif vname == "video_status.json":
-                        p["has_video_status"] = True
-
-        result = []
-        for slug, p in projects.items():
-            if p["has_meta"]:
-                meta = r2_read_json(s3, f"projects/{slug}/meta.json")
-                if isinstance(meta, dict) and meta.get("title"):
-                    p["title"] = meta["title"]
-            if p["has_video_status"]:
-                st = r2_read_json(s3, f"projects/{slug}/_video/video_status.json") or {}
-                p["video_status"] = st
-            else:
-                p["video_status"] = {
-                    "status": "completed" if p["has_video"] else "not_started",
-                    "percent": 100 if p["has_video"] else 0,
-                    "message": "ভিডিও তৈরি সম্পন্ন" if p["has_video"] else "এখনো ভিডিও তৈরি করা হয়নি",
-                }
-            result.append(p)
-
-        result.sort(key=lambda x: x["last_modified"], reverse=True)
-        return jsonify({"videos": result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/video/presign-download/<slug>", methods=["GET"])
-def api_video_presign_download(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    mode = request.args.get("mode", "download")
-    key = f"projects/{slug}/_video/final_video.mp4"
-    params = {
-        "Bucket": R2_BUCKET_NAME,
-        "Key": key,
-    }
-    if mode != "play":
-        params["ResponseContentDisposition"] = f'attachment; filename="{slug}.mp4"'
-
-    try:
-        url = s3.generate_presigned_url("get_object", Params=params, ExpiresIn=PRESIGN_TTL_LONG)
-        return jsonify({"url": url})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/video/delete/<slug>", methods=["POST"])
-def api_video_delete(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    try:
-        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=f"projects/{slug}/_video/final_video.mp4")
-        r2_write_json(
-            s3,
-            f"projects/{slug}/_video/video_status.json",
-            {
-                "slug": slug,
-                "status": "not_started",
-                "percent": 0,
-                "message": "পুরোনো ভিডিও ডিলিট করা হয়েছে",
-                "updated_at": now_utc_iso(),
-            },
-        )
-        return jsonify({"status": "deleted"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-# ================= Cloudflare R2 স্টোরেজ API =================
-@app.route("/api/r2/projects", methods=["GET"])
-def r2_list_projects():
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "Cloudflare R2 কনফিগার করা নেই।"}), 500
-
-    projects = {}
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix="projects/"):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                parts = key.split("/")
-                if len(parts) < 3 or not parts[2]:
-                    continue
-                slug = parts[1]
-                filename = parts[2]
-                if slug not in projects:
-                    projects[slug] = {
-                        "slug": slug,
-                        "title": slug,
-                        "image_count": 0,
-                        "total_bytes": 0,
-                        "last_modified": "",
-                        "has_meta": False,
-                    }
-                p = projects[slug]
-                p["total_bytes"] += obj.get("Size", 0)
-                lm = obj["LastModified"].strftime("%Y-%m-%d %H:%M")
-                if lm > p["last_modified"]:
-                    p["last_modified"] = lm
-                if len(parts) == 3:
-                    if filename.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                        p["image_count"] += 1
-                    elif filename == "meta.json":
-                        p["has_meta"] = True
-
-        for slug, p in projects.items():
-            if p["has_meta"]:
-                meta = r2_read_json(s3, f"projects/{slug}/meta.json")
-                if isinstance(meta, dict) and meta.get("title"):
-                    p["title"] = meta["title"]
-
-        result = sorted(projects.values(), key=lambda x: x["last_modified"], reverse=True)
-        return jsonify({"projects": result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/r2/project/<slug>/files", methods=["GET"])
-def r2_list_project_files(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    files = []
-    prefix = f"projects/{slug}/"
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                key = obj["Key"]
-                name = key[len(prefix):]
-                if not name or "/" in name or name in INTERNAL_PROJECT_FILES:
-                    continue
-                files.append({
-                    "key": key,
-                    "name": name,
-                    "size": obj.get("Size", 0),
-                    "is_image": name.lower().endswith((".jpg", ".jpeg", ".png", ".webp")),
-                })
-        files.sort(key=lambda x: x["name"])
-        return jsonify({"slug": slug, "files": files})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/r2/file", methods=["GET"])
-def r2_stream_file():
-    """Render-এর ব্যান্ডউইথ বাঁচাতে সরাসরি Cloudflare R2 Presigned URL-এ ৩০২ রিডাইরেক্ট করে"""
-    key = request.args.get("key", "").strip()
-    download = request.args.get("download", "0") == "1"
-    if not key or not key.startswith("projects/") or ".." in key:
-        return jsonify({"error": "Invalid key"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    filename = key.split("/")[-1]
-    params = {
-        "Bucket": R2_BUCKET_NAME,
-        "Key": key,
-    }
-    if download:
-        params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
-
-    try:
-        url = s3.generate_presigned_url("get_object", Params=params, ExpiresIn=PRESIGN_TTL_LONG)
-        return redirect(url, code=302)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 404
-
-
-def _build_zip_download_url(s3, slug):
-    archive_key = f"projects/{slug}/_archive/{slug}.zip"
-    return s3.generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": R2_BUCKET_NAME,
-            "Key": archive_key,
-            "ResponseContentDisposition": f'attachment; filename="{slug}.zip"',
-        },
-        ExpiresIn=PRESIGN_TTL_LONG,
-    )
-
-
-@app.route("/api/r2/zip-status/<slug>", methods=["GET"])
-def r2_zip_status(slug):
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    archive_key = f"projects/{slug}/_archive/{slug}.zip"
-    head = r2_head_object(s3, archive_key)
-    if head:
-        return jsonify({
-            "slug": slug,
-            "status": "completed",
-            "percent": 100,
-            "size_bytes": head.get("ContentLength", 0),
-            "download_url": _build_zip_download_url(s3, slug),
-            "message": "ZIP তৈরি সম্পন্ন! ডাউনলোড শুরু হচ্ছে...",
-        })
-
-    st = r2_read_json(s3, f"projects/{slug}/_archive/zip_status.json", default=None) or {
-        "slug": slug,
-        "status": "not_started",
-        "percent": 0,
-        "message": "ZIP তৈরি হয়নি",
-    }
-    return jsonify(st)
-
-
-@app.route("/api/r2/download-zip/<slug>", methods=["GET"])
-def r2_stream_zip(slug):
-    """৫ GB+ ZIP-ও Render দিয়ে পাস না করে R2 থেকে সরাসরি ডাউনলোড করায় (দরকারে ২য় সার্ভারে তৈরি করে)"""
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    archive_key = f"projects/{slug}/_archive/{slug}.zip"
-    head = r2_head_object(s3, archive_key)
-    if head:
-        return redirect(_build_zip_download_url(s3, slug), code=302)
-
-    if GITHUB_PAT:
-        st = r2_read_json(s3, f"projects/{slug}/_archive/zip_status.json", default={}) or {}
-        curr_status = str(st.get("status") or "").lower()
-        updated_str = str(st.get("updated_at") or "")
-        is_recent_active = False
-        if curr_status in ("queued", "downloading", "zipping", "uploading") and updated_str:
-            try:
-                upd_dt = datetime.fromisoformat(updated_str.replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - upd_dt).total_seconds() < 1200:
-                    is_recent_active = True
-            except Exception:
-                pass
-
-        if not is_recent_active:
-            ok, msg = trigger_github_video_render(slug, mode="zip")
-            if not ok:
-                return Response(
-                    f"<html><body style='font-family:sans-serif;background:#0f172a;color:#f8fafc;padding:40px;text-align:center'>"
-                    f"<h2>ZIP তৈরি শুরু করা যায়নি</h2><p>{html.escape(msg)}</p>"
-                    f"<p style='color:#94a3b8'>নিশ্চিত করুন ২য় সার্ভারের <code>.github/workflows/render.yml</code> আপডেট করা আছে।</p>"
-                    f"</body></html>",
-                    status=500,
-                    mimetype="text/html; charset=utf-8",
-                )
-
-        safe_slug = html.escape(slug)
-        wait_html = f"""<!doctype html>
-<html lang="bn">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ZIP প্রস্তুত হচ্ছে — {safe_slug}</title>
-<style>
-  body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0b1120;color:#e2e8f0;font-family:system-ui,sans-serif;padding:20px}}
-  .card{{max-width:460px;width:100%;background:#111827;border:1px solid #1e293b;border-radius:16px;padding:28px;text-align:center;box-shadow:0 20px 50px rgba(0,0,0,.4)}}
-  .bar-bg{{height:10px;background:#1e293b;border-radius:99px;overflow:hidden;margin:18px 0}}
-  .bar{{height:100%;width:10%;background:linear-gradient(90deg,#38bdf8,#6366f1);transition:width .4s ease}}
-  .muted{{color:#94a3b8;font-size:14px}}
-  .btn{{display:none;margin-top:16px;padding:12px 20px;background:#2563eb;color:#fff;text-decoration:none;border-radius:10px;font-weight:600}}
-</style>
-</head>
-<body>
-  <div class="card">
-    <h2>📦 Cloudflare R2-তে ZIP তৈরি হচ্ছে</h2>
-    <p class="muted">Render-এর ব্যান্ডউইথ বাঁচাতে ২য় সার্ভার সরাসরি R2-তে ZIP বানাচ্ছে। তৈরি হলেই অটোমেটিক ডাউনলোড শুরু হবে।</p>
-    <div class="bar-bg"><div class="bar" id="bar"></div></div>
-    <div id="msg" class="muted">অপেক্ষা করুন...</div>
-    <a id="dl" class="btn" href="#">ডাউনলোড শুরু না হলে এখানে ক্লিক করুন</a>
-  </div>
-<script>
-const slug = {json.dumps(slug)};
-async function poll() {{
-  try {{
-    const r = await fetch(`/api/r2/zip-status/${{encodeURIComponent(slug)}}`);
-    const d = await r.json();
-    if (d.percent !== undefined) document.getElementById('bar').style.width = Math.max(8, d.percent) + '%';
-    if (d.message) document.getElementById('msg').textContent = `${{d.percent || 0}}% — ${{d.message}}`;
-    if (d.status === 'completed' && d.download_url) {{
-      const a = document.getElementById('dl');
-      a.href = d.download_url;
-      a.style.display = 'inline-block';
-      window.location.href = d.download_url;
-      return;
-    }}
-    if (d.status === 'failed') {{
-      document.getElementById('msg').style.color = '#f87171';
-      return;
-    }}
-  }} catch (e) {{}}
-  setTimeout(poll, 3500);
-}}
-poll();
-</script>
-</body>
-</html>"""
-        return Response(wait_html, mimetype="text/html; charset=utf-8")
-
-    objects_to_zip = []
-    prefix = f"projects/{slug}/"
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=prefix):
-            for obj in page.get("Contents", []):
-                name = obj["Key"][len(prefix):]
-                if not name or "/" in name or name in INTERNAL_PROJECT_FILES:
-                    continue
-                objects_to_zip.append((name, obj["Key"], obj["LastModified"].replace(tzinfo=None)))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-    if not objects_to_zip:
-        return jsonify({"error": "No files found in this project"}), 404
-
-    objects_to_zip.sort(key=lambda x: x[0])
-
-    def member_files():
-        for name, key, mod_time in objects_to_zip:
-            def chunk_iter(obj_key=key):
-                resp = s3.get_object(Bucket=R2_BUCKET_NAME, Key=obj_key)
-                body = resp["Body"]
-                try:
-                    for chunk in body.iter_chunks(chunk_size=65536):
-                        if chunk:
-                            yield chunk
-                finally:
-                    body.close()
-
-            yield (name, mod_time, S_IFREG | 0o644, ZIP_32, chunk_iter())
-
-    return Response(
-        stream_with_context(stream_zip(member_files())),
-        mimetype="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{slug}.zip"'},
-    )
-
-
-@app.route("/api/r2/delete-file", methods=["POST"])
-def r2_delete_file():
-    data = request.get_json(silent=True) or {}
-    key = str(data.get("key", "")).strip()
-    if not key or not key.startswith("projects/") or ".." in key:
-        return jsonify({"error": "Invalid key"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    try:
-        s3.delete_object(Bucket=R2_BUCKET_NAME, Key=key)
-        parts = key.split("/")
-        if len(parts) >= 3 and parts[1]:
-            r2_invalidate_archive_zip(s3, parts[1])
-        return jsonify({"status": "deleted"})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/r2/delete-project", methods=["POST"])
-def r2_delete_project():
-    data = request.get_json(silent=True) or {}
-    slug = str(data.get("slug", "")).strip()
-    if not re.match(r"^[a-zA-Z0-9_-]+$", slug):
-        return jsonify({"error": "Invalid project slug"}), 400
-
-    s3 = get_r2_client()
-    if not s3:
-        return jsonify({"error": "R2 not configured"}), 500
-
-    try:
-        paginator = s3.get_paginator("list_objects_v2")
-        deleted_count = 0
-        for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=f"projects/{slug}/"):
-            keys = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
-            if keys:
-                s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": keys})
-                deleted_count += len(keys)
-        return jsonify({"status": "deleted", "count": deleted_count})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
-if __name__ == "__main__":
-    bootstrap_from_r2()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+                target["p
