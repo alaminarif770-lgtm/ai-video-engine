@@ -2,6 +2,7 @@ flask
 requests
 pillow
 gunicorn
-gemini-webapi
+gemini-webapi==2.1.1
+curl-cffi
 boto3
 stream-zip
