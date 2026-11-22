@@ -118,8 +118,125 @@ def extract_1psid_only(raw_psid):
     return psid or str(raw_psid or "").strip()[:155]
 
 
+import gemini_webapi.client as _gw_client
+
+
 def inject_full_cookiejar(client):
-    """client.cookies এবং curl_cffi AsyncSession-এর CookieJar-এ ডোমেইনসহ সব কুকি বসিয়ে দেয়"""
+    """client.cookies এবং client.client (curl_cffi/httpx)-এর CookieJar-এ ডোমেইনসহ সব ২৫টি কুকি বসিয়ে দেয়"""
+    full_dict = getattr(client, "_full_cookie_dict", None) or {}
+    full_list = getattr(client, "_full_cookie_list", None) or []
+    if not full_dict:
+        return
+
+    if hasattr(client, "cookies") and isinstance(client.cookies, dict):
+        client.cookies.update(full_dict)
+    else:
+        client.cookies = dict(full_dict)
+
+    # gemini-webapi 2.1.1 এ সেশনের আসল নাম হলো client.client
+    for attr in ("client", "_client", "session", "_session"):
+        session = getattr(client, attr, None)
+        if session is not None and hasattr(session, "cookies"):
+            for item in full_list:
+                n, v = item["name"], item["value"]
+                dom = item.get("domain") or ".google.com"
+                path = item.get("path") or "/"
+                for target_dom in (dom, ".google.com", "gemini.google.com", ".googleusercontent.com"):
+                    try:
+                        session.cookies.set(n, v, domain=target_dom, path=path)
+                    except Exception:
+                        try:
+                            session.cookies[n] = v
+                        except Exception:
+                            pass
+
+
+def normalize_gemini_image_url(raw_url: str) -> str:
+    url = str(raw_url or "").strip()
+    if not url:
+        return url
+    parts = urlsplit(url)
+    path = re.sub(r"=[a-zA-Z0-9_-]+$", "", parts.path)
+    if not path.endswith("=s0"):
+        path = f"{path}=s0"
+    q_dict = dict(parse_qsl(parts.query, keep_blank_values=True))
+    q_dict["alr"] = "yes"
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(q_dict), parts.fragment))
+
+
+async def download_gemini_image_bytes(client, image_obj) -> bytes:
+    raw_url = getattr(image_obj, "url", None)
+    if not raw_url:
+        raise RuntimeError("ইমেজ অবজেক্টে কোনো URL পাওয়া যায়নি")
+
+    final_url = normalize_gemini_image_url(raw_url)
+    inject_full_cookiejar(client)
+
+    headers = {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Referer": "https://gemini.google.com/",
+        "User-Agent": (getattr(client, "headers", None) or {}).get(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        ),
+    }
+
+    session = None
+    for attr in ("client", "_client", "session", "_session"):
+        s_obj = getattr(client, attr, None)
+        if s_obj is not None and hasattr(s_obj, "get"):
+            session = s_obj
+            break
+
+    if session is not None:
+        resp = await session.get(final_url, headers=headers, allow_redirects=True, timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+
+    from curl_cffi.requests import AsyncSession
+    async with AsyncSession(impersonate="chrome") as tmp_sess:
+        for k, v in (client.cookies or {}).items():
+            for d in (".google.com", "gemini.google.com", ".googleusercontent.com"):
+                try:
+                    tmp_sess.cookies.set(k, v, domain=d, path="/")
+                except Exception:
+                    pass
+        resp = await tmp_sess.get(final_url, headers=headers, allow_redirects=True, timeout=35)
+        if resp.status_code == 200 and len(resp.content) > 1000:
+            return resp.content
+        raise RuntimeError(f"ইমেজ ডাউনলোড ব্যর্থ (HTTP {resp.status_code})")
+
+
+# ১. get_access_token যাতে ২৫টি কুকি মুছে না ফেলে, সবগুলো ধরে রাখে
+if hasattr(_gw_client, "get_access_token"):
+    _orig_get_access_token = _gw_client.get_access_token
+    async def _hooked_get_access_token(*args, **kwargs):
+        token, valid_cookies = await _orig_get_access_token(*args, **kwargs)
+        base_c = kwargs.get("base_cookies") or (args[0] if args else {})
+        merged = dict(base_c or {})
+        if isinstance(valid_cookies, dict):
+            merged.update(valid_cookies)
+        return token, merged
+    _gw_client.get_access_token = _hooked_get_access_token
+
+
+# ২. GeminiClient শুরুতেই ২৫টি কুকি পার্স ও সেভ করে নেবে
+_orig_gemini_init = GeminiClient.__init__
+def _hooked_gemini_init(self, secure_1psid=None, secure_1psidts=None, *args, **kwargs):
+    real_psid, real_psidts, c_list, c_dict = parse_full_cookies_input(secure_1psid, secure_1psidts)
+    _orig_gemini_init(self, secure_1psid=real_psid or secure_1psid, secure_1psidts=real_psidts or secure_1psidts, *args, **kwargs)
+    self._full_cookie_list = c_list
+    self._full_cookie_dict = c_dict
+    if c_dict:
+        self.cookies.update(c_dict)
+
+GeminiClient.__init__ = _hooked_gemini_init
+
+_orig_gemini_async_init = GeminiClient.init
+async def _hooked_gemini_async_init(self, *args, **kwargs):
+    if getattr(self, "_full_cookie_dict", None):
+        self.cookies.update(self._full_cookie_dict)
+    res = await _orig_gemini_
     full_dict = getattr(client, "_full_cookie_dict", None) or {}
     full_list = getattr(client, "_full_cookie_list", None) or []
     if not full_dict:
