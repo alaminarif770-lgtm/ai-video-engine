@@ -66,7 +66,12 @@ R2_ACCESS_KEY_ID = get_conf("R2_ACCESS_KEY_ID")
 R2_SECRET_ACCESS_KEY = get_conf("R2_SECRET_ACCESS_KEY")
 R2_BUCKET_NAME = get_conf("R2_BUCKET_NAME", "story-assets")
 
-PROXY_URL = get_conf("PROXY")  # প্রক্সি লিংক (যদি থাকে)
+PROXY_RAW = get_conf("PROXY")
+# প্রক্সি লিংক অটো-ক্লিন (tcp:// থাকলে স্বয়ংক্রিয়ভাবে http:// তে রূপান্তর)
+if PROXY_RAW.startswith("tcp://"):
+    PROXY_URL = "http://" + PROXY_RAW[6:]
+else:
+    PROXY_URL = PROXY_RAW
 
 GITHUB_PAT = get_conf("GITHUB_PAT")
 GITHUB_OWNER = get_conf("GITHUB_OWNER", "alaminarif770-lgtm")
@@ -422,7 +427,7 @@ def _make_cookie_record(psid, psidts=None, name="", enabled=True, existing_dict=
         "psidts": psidts,
         "enabled": bool(enabled),
         "version": int((existing_dict or {}).get("version", 1)),
-        "status": "paused" if not enabled else (existing_dict or {}).get("status", "standby"),
+        "status": "standby" if enabled else "paused",
         "success_count": int((existing_dict or {}).get("success_count", 0)),
         "fail_count": int((existing_dict or {}).get("fail_count", 0)),
         "consecutive_fails": int((existing_dict or {}).get("consecutive_fails", 0)),
@@ -996,7 +1001,7 @@ def trigger_github_video_render(slug, mode="video"):
         return False, str(e)[:150]
 
 
-# ================= কুকি টেস্ট ওয়ার্কার =================
+# ================= কুকি টেস্ট ওয়ার্কার (১৮ সেকেন্ড হার্ড টাইমআউট সহ) =================
 async def _test_single_cookie_async(cookie_entry):
     cid = cookie_entry["id"]
     with state_lock:
@@ -1008,14 +1013,17 @@ async def _test_single_cookie_async(cookie_entry):
     add_log(f"🔍 {cookie_entry['name']} ({cookie_entry['preview']}) পরীক্ষা করা হচ্ছে...")
     client = None
     try:
-        # প্রক্সি সাপোর্টসহ ইনিট
         client = GeminiClient(
             secure_1psid=cookie_entry["psid"],
             secure_1psidts=cookie_entry.get("psidts"),
             proxy=PROXY_URL if PROXY_URL else None,
         )
-        await client.init(timeout=45, auto_close=False, auto_refresh=True)
-        _sync_client_cookies_to_storage(cid, client)  # নতুন কুকি সেভ
+        # ১৮ সেকেন্ড হার্ড টাইমআউট: প্রক্সি বা গুগল রেসপন্স না দিলে আটকে থাকবে না
+        await asyncio.wait_for(
+            client.init(timeout=15, auto_close=False, auto_refresh=True),
+            timeout=18.0,
+        )
+        _sync_client_cookies_to_storage(cid, client)
 
         with state_lock:
             for c in cookie_pool:
@@ -1027,6 +1035,17 @@ async def _test_single_cookie_async(cookie_entry):
                     c["last_error"] = ""
         add_log(f"✅ {cookie_entry['name']} একদম সচল আছে!")
         return True
+    except asyncio.TimeoutError:
+        err = "টাইমআউট (১৮ সেকেন্ডে প্রক্সি বা গুগলে রেসপন্স পাওয়া যায়নি)"
+        with state_lock:
+            for c in cookie_pool:
+                if c["id"] == cid:
+                    c["status"] = "failed"
+                    c["fail_count"] += 1
+                    c["last_error"] = err
+        add_log(f"❌ {cookie_entry['name']} কাজ করছে না: {err}")
+        notify_cookie_issue(cookie_entry["name"], cookie_entry["preview"], err, level="critical")
+        return False
     except Exception as e:
         err = str(e)[:150]
         with state_lock:
@@ -1041,7 +1060,7 @@ async def _test_single_cookie_async(cookie_entry):
     finally:
         if client:
             try:
-                await asyncio.wait_for(client.close(), timeout=4)
+                await asyncio.wait_for(client.close(), timeout=3)
             except Exception:
                 pass
 
@@ -1353,19 +1372,18 @@ async def _call_gemini_with_pool(
             update_state(status_text=f"Connecting {acc_label}...", active_account=acc_label)
             add_log(f"🔑 {acc_label} ({chosen['preview']}) কানেক্ট হচ্ছে...")
             try:
-                # প্রক্সি সাপোর্টসহ জেমিনি ক্লায়েন্ট
                 client = GeminiClient(
                     secure_1psid=chosen["psid"],
                     secure_1psidts=chosen.get("psidts"),
                     proxy=PROXY_URL if PROXY_URL else None,
                 )
                 await run_cancellable(
-                    client.init(timeout=45, auto_close=False, auto_refresh=True),
+                    client.init(timeout=30, auto_close=False, auto_refresh=True),
                     stop_event,
-                    timeout=50,
+                    timeout=35,
                 )
                 clients_map[cid] = (client, c_ver)
-                _sync_client_cookies_to_storage(cid, client)  # রিনিউ কুকি সংরক্ষণ
+                _sync_client_cookies_to_storage(cid, client)
                 add_log(f"✅ {acc_label} কানেক্ট হয়েছে!")
             except InterruptedError:
                 raise
@@ -1390,7 +1408,7 @@ async def _call_gemini_with_pool(
         try:
             coro = client.generate_content(prompt, files=files) if files else client.generate_content(prompt)
             response = await run_cancellable(coro, stop_event, timeout=95)
-            _sync_client_cookies_to_storage(cid, client)  # প্রতিটি কলের পর কুকি রিনিউ চেক
+            _sync_client_cookies_to_storage(cid, client)
 
             if not expect_image:
                 resp_text = (getattr(response, "text", "") or "").strip()
@@ -1405,7 +1423,6 @@ async def _call_gemini_with_pool(
                 _mark_cookie_success(cid)
                 return "OK", resp_text, acc_label
 
-            # ইমেজ রেসপন্স হ্যান্ডলিং
             if not response or not response.images:
                 resp_text = (getattr(response, "text", "") or "").strip()[:140]
                 if _is_auth_error(resp_text):
@@ -1420,8 +1437,7 @@ async def _call_gemini_with_pool(
             first_image = response.images[0]
             raw_bytes = None
 
-            # ================= ব্যান্ডউইথ সেভিং অপটিমাইজেশন =================
-            # গুগলের ১ MB ছবি প্রক্সি দিয়ে না টেনে সরাসরি রেন্ডারের ফ্রি ব্যান্ডউইথ দিয়ে ডাউনলোড
+            # ব্যান্ডউইথ সেভিং অপটিমাইজেশন (সরাসরি রেন্ডার দিয়ে বড় ছবি ডাউনলোড)
             img_url = getattr(first_image, "url", None)
             if img_url:
                 try:
@@ -1440,7 +1456,6 @@ async def _call_gemini_with_pool(
                 except Exception:
                     raw_bytes = None
 
-            # ফলব্যাক: ডিরেক্ট ফেচ না হলে সাধারণ save() মেথড
             if not raw_bytes:
                 await run_cancellable(
                     first_image.save(path=STORAGE_DIR, filename=temp_filename),
@@ -1824,7 +1839,6 @@ async def async_generation_worker(
             f"কাজ শুরু হয়েছে!"
         )
 
-        # ================= কনসিস্টেন্সি সেটআপ =================
         auto_bible = {"style_bible": style_bible, "eras": eras_map, "characters": chars_map, "char_keywords": {}, "era_keywords": {}}
         if consistency_mode == "auto" and not style_bible and not chars_map:
             auto_bible = await _auto_analyze_old_json(
@@ -1921,7 +1935,6 @@ async def async_generation_worker(
                     sf.write(sa_bytes)
                 add_log("♻️ R2 থেকে Style Anchor ইমেজ রিস্টোর হয়েছে।")
 
-        # ================= একক সিন জেনারেশন =================
         aborted_no_cookies = False
         scene_lookup = {}
         uploaded_new_scene = False
@@ -2334,7 +2347,6 @@ def api_add_cookie():
         record = _make_cookie_record(psid=psid, psidts=psidts, name=final_name, enabled=True)
         cookie_pool.append(record)
         running_now = state["is_running"]
-        testing_now = state["is_testing_cookies"]
 
     _clear_gemini_cache(psid)
     save_cookies_to_r2()
@@ -2343,13 +2355,12 @@ def api_add_cookie():
     if running_now:
         add_log(f"➕ নতুন সহযোগী কুকি অ্যাড হয়েছে: {final_name} ({record['preview']}) — সিরিয়ালে যুক্ত হয়েছে!")
     else:
-        add_log(f"➕ নতুন কুকি অ্যাড হয়েছে: {final_name} ({record['preview']})")
-        if not testing_now:
-            threading.Thread(target=test_cookies_worker, args=(record["id"],), daemon=True).start()
+        # স্বয়ংক্রিয় হ্যাং টেস্ট বন্ধ করা হয়েছে, ইউজার যখন Test চাপবেন তখনই টেস্ট হবে
+        add_log(f"➕ নতুন কুকি অ্যাড হয়েছে: {final_name} ({record['preview']}) — Test Connection চাপুন।")
 
     return jsonify({
         "status": "added",
-        "message": f"{final_name} সফলভাবে অ্যাড হয়েছে!" + (" চলমান প্রজেক্টে পরের সিরিয়ালে কাজে নামবে।" if running_now else ""),
+        "message": f"{final_name} সফলভাবে অ্যাড হয়েছে! এখন Test Connection চাপুন।",
     })
 
 
@@ -2530,10 +2541,8 @@ def start_pipeline():
     with state_lock:
         if state["is_running"]:
             return jsonify({"error": "একটি কাজ ইতিমধ্যেই চলছে!"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট শেষ হওয়া পর্যন্ত একটু অপেক্ষা করুন।"}), 400
         if not any(c.get("enabled", True) for c in cookie_pool):
-            return jsonify({"error": "কোনো সক্রিয় কুকি নেই! Cookies ট্যাব থেকে কুকি অ্যাড বা Resume করুন।"}), 400
+            return jsonify({"error": "কোনো সক্রিয় কুকি নেই! Cookies ট্যাব থেকে কুকি দিন।"}), 400
         state["should_stop"] = False
         state["is_paused"] = False
 
@@ -2639,8 +2648,6 @@ def api_resume_history(slug):
     with state_lock:
         if state["is_running"]:
             return jsonify({"error": "আরেকটি কাজ ইতিমধ্যেই চলছে!"}), 400
-        if state["is_testing_cookies"]:
-            return jsonify({"error": "কুকি টেস্ট শেষ হওয়া পর্যন্ত অপেক্ষা করুন।"}), 400
         if not any(c.get("enabled", True) for c in cookie_pool):
             return jsonify({"error": "কোনো সক্রিয় কুকি নেই! আগে Cookies ট্যাবে কুকি দিন।"}), 400
 
@@ -2700,7 +2707,7 @@ def api_delete_history(slug):
     return jsonify({"status": "deleted"})
 
 
-# ================= Phase-2: ভিডিও রেন্ডার ও ডাইরেক্ট R2 Presigned API =================
+# ================= Phase-2: ভিডিও রেন্ডার API =================
 @app.route("/api/video/slug", methods=["POST"])
 def api_video_slug():
     data = request.get_json(silent=True) or {}
